@@ -1,27 +1,28 @@
 #!/bin/bash
 #
-# Refresh KillBot from the main branch (default) or from a git ref / GitHub Release.
+# Refresh KillBot from the main repository, or from the test repository.
 #
 # Usage:
 #   sudo /opt/killbot/UpdateAll.sh
-#   sudo /opt/killbot/UpdateAll.sh test
 #   sudo /opt/killbot/UpdateAll.sh main
+#   sudo /opt/killbot/UpdateAll.sh test
 #   sudo /opt/killbot/UpdateAll.sh latest
 #   sudo /opt/killbot/UpdateAll.sh v3.4
 #   sudo /opt/killbot/UpdateAll.sh <commit>
 #
 set -e
 
-KB_GIT_REPO="${KB_GIT_REPO:-grigoriy-melnikov/KillBot}"
-REF="${1:-test}"
+KB_MAIN_REPO="KillBot-Group/killbot"
+KB_TEST_REPO="KillBot-Group/killbot-test"
+REF="${1:-main}"
 
 usage() {
-    echo "Usage: $0 [test|main|latest|TAG|BRANCH|COMMIT]"
-    echo "  (no arg) / test     installer and files from the test branch"
-    echo "  main                installer and files from the main branch"
-    echo "  latest              installer from GitHub Releases latest"
-    echo "  v3.4                installer from that GitHub Release"
-    echo "  BRANCH / COMMIT     installer and files from that git revision"
+    echo "Usage: $0 [main|test|latest|TAG|BRANCH|COMMIT]"
+    echo "  (no arg) / main     installer and files from ${KB_MAIN_REPO}"
+    echo "  test                installer and files from ${KB_TEST_REPO}"
+    echo "  latest              installer from GitHub Releases of the main repository"
+    echo "  v3.4                installer from that GitHub Release of the main repository"
+    echo "  BRANCH / COMMIT     that revision of the main repository"
     exit 1
 }
 
@@ -77,13 +78,21 @@ install_ref() {
     esac
 }
 
-URL="$(installer_url "$REF")"
-KB_GIT_REF="$(install_ref "$REF")"
+if [[ "$REF" == "test" ]]; then
+    KB_GIT_REPO="${KB_TEST_REPO}"
+    KB_GIT_REF="main"
+    URL="$(installer_url "main")"
+else
+    KB_GIT_REPO="${KB_MAIN_REPO}"
+    URL="$(installer_url "$REF")"
+    KB_GIT_REF="$(install_ref "$REF")"
+fi
 
 rm -f kbi.sh
 rm -f kb_install.sh
 echo "Downloading kb_install.sh from ${URL}"
+echo "Repository ${KB_GIT_REPO}, ref ${KB_GIT_REF}"
 wget -O kbi.sh "$URL"
 chmod +x kbi.sh
-echo "Installing with KB_GIT_REF=${KB_GIT_REF}"
-yes '' | sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a KB_GIT_REF="${KB_GIT_REF}" ./kbi.sh
+echo "Installing with KB_GIT_REPO=${KB_GIT_REPO} KB_GIT_REF=${KB_GIT_REF}"
+yes '' | sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a KB_GIT_REPO="${KB_GIT_REPO}" KB_GIT_REF="${KB_GIT_REF}" ./kbi.sh

@@ -18,17 +18,51 @@ KILLBOT_SESSION_LIFETIME=86400 #sec
 
 set -e # Exit immediately if any command fails
 
-# Optional git ref for raw downloads (branch, tag, or commit).
-# UpdateAll.sh passes KB_GIT_REF. Default is the test branch while we debug.
+# Repository for html/ and sh/ downloads.
+#   ./kb_install.sh            KillBot-Group/killbot, branch main
+#   ./kb_install.sh main       same
+#   ./kb_install.sh test       KillBot-Group/killbot-test, branch main
+#   KB_GIT_REPO=test ./kb_install.sh
+# KB_GIT_REF selects a branch, tag, or commit inside that repository (default main).
+KB_MAIN_REPO="KillBot-Group/killbot"
+KB_TEST_REPO="KillBot-Group/killbot-test"
+KB_CHOICE=""
+if [[ -z "${KB_GIT_REPO:-}" && -n "${1:-}" && "$1" != -* ]]; then
+  case "$1" in
+    test|main)
+      KB_CHOICE="$1"
+      shift
+      ;;
+  esac
+fi
 if [[ -z "${KB_GIT_REF:-}" && -n "${1:-}" && "$1" != -* ]]; then
   KB_GIT_REF="$1"
 fi
-KB_GIT_REF="${KB_GIT_REF:-test}"
+case "${KB_GIT_REPO:-${KB_CHOICE:-main}}" in
+  ""|main|killbot|"${KB_MAIN_REPO}")
+    KB_GIT_REPO="${KB_MAIN_REPO}"
+    ;;
+  test|killbot-test|"${KB_TEST_REPO}")
+    KB_GIT_REPO="${KB_TEST_REPO}"
+    ;;
+  */*)
+    ;;
+  *)
+    echo "ERROR: unknown repository: ${KB_GIT_REPO:-$KB_CHOICE}" >&2
+    exit 1
+    ;;
+esac
+KB_GIT_REF="${KB_GIT_REF:-main}"
 if [[ ! "$KB_GIT_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$KB_GIT_REF" == *..* ]]; then
-  echo "ERROR: invalid KB_GIT_REF: ${KB_GIT_REF}"
+  echo "ERROR: invalid KB_GIT_REF: ${KB_GIT_REF}" >&2
   exit 1
 fi
-KB_GIT_RAW="https://raw.githubusercontent.com/grigoriy-melnikov/KillBot/${KB_GIT_REF}"
+if [[ ! "$KB_GIT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: invalid KB_GIT_REPO: ${KB_GIT_REPO}" >&2
+  exit 1
+fi
+KB_GIT_RAW="https://raw.githubusercontent.com/${KB_GIT_REPO}/${KB_GIT_REF}"
+echo "KillBot files: ${KB_GIT_RAW}"
 
 kb_download() {
   local dest="$1"
