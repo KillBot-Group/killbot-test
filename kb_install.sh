@@ -120,6 +120,12 @@ kb_disable_mptcp() {
 }
 kb_disable_mptcp
 
+if [ -d /opt/killbot/backups ]; then
+    sudo rm -rf /opt/killbot/backups
+    echo "Removed /opt/killbot/backups"
+fi
+sudo rm -f /opt/killbot/backup_send.sh /opt/killbot/backup_restore.sh
+
 # PHP2Shell (CVE-2026-109618, CVE-2026-109619): unauthenticated RCE in the
 # interpreter. Fixed in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. PHP 8.1 is EOL
 # and is not patched. Ubuntu 22.04 ships 8.1, so KillBot installs a patched
@@ -2134,24 +2140,6 @@ FILE="/opt/killbot/dns_provider_hint.sh"
         exit 1
     fi
 
-FILE="/opt/killbot/backup_send.sh"
-    kb_download "$FILE" "sh/backup_send.sh"
-    if [ $? -eq 0 ]; then
-        echo "The backup_send.sh has been successfully loaded."
-    else
-        echo "Error loading the backup_send.sh."
-        exit 1
-    fi
-
-FILE="/opt/killbot/backup_restore.sh"
-    kb_download "$FILE" "sh/backup_restore.sh"
-    if [ $? -eq 0 ]; then
-        echo "The backup_restore.sh has been successfully loaded."
-    else
-        echo "Error loading the backup_restore.sh."
-        exit 1
-    fi
-
 echo "Setting permissions on KillBot scripts..."
 for f in \
     /opt/killbot/check_killbot_reverse_proxy.sh \
@@ -2160,8 +2148,6 @@ for f in \
     /opt/killbot/update-symmetric-ip.sh \
     /opt/killbot/check_host_curl.sh \
     /opt/killbot/read_apache_log.sh \
-    /opt/killbot/backup_send.sh \
-    /opt/killbot/backup_restore.sh \
     /opt/killbot/f2b/subnet-monitor.sh \
     /opt/killbot/UpdateAll.sh \
     /opt/killbot/official_allowed_ips.sh \
@@ -7113,8 +7099,6 @@ echo "# Clean unuser certs for KillBot
 * * * * * root /opt/killbot/check_killbot_reverse_proxy.sh >> /var/log/killbot/check_killbot_reverse_proxy.log 2>&1
 # Reload nginx/apache after Let's Encrypt cert files are replaced on the LE server
 15 3 * * 3,6 root /etc/init.d/kb reload >> /var/log/killbot/kb-reload.log 2>&1
-# Off by default: backup_send.sh uploads to backups.killbot.ru. Uncomment if you want that.
-#40 3 * * * root /opt/killbot/backup_send.sh >> /var/log/killbot/backup-send.log 2>&1
 " | sudo tee "$CRON_FILE" > /dev/null
 
 # flush iptables if any subnets were blocked
