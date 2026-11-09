@@ -19,7 +19,7 @@ REF="${1:-main}"
 usage() {
     echo "Usage: $0 [main|test|latest|TAG|BRANCH|COMMIT]"
     echo "  (no arg) / main     installer and files from ${KB_MAIN_REPO}"
-    echo "  test                installer and files from ${KB_TEST_REPO}"
+    echo "  test                installer and files from ${KB_TEST_REPO}, branch test"
     echo "  latest              installer from GitHub Releases of the main repository"
     echo "  v3.4                installer from that GitHub Release of the main repository"
     echo "  BRANCH / COMMIT     that revision of the main repository"
@@ -80,8 +80,8 @@ install_ref() {
 
 if [[ "$REF" == "test" ]]; then
     KB_GIT_REPO="${KB_TEST_REPO}"
-    KB_GIT_REF="main"
-    URL="$(installer_url "main")"
+    KB_GIT_REF="test"
+    URL="$(installer_url "test")"
 else
     KB_GIT_REPO="${KB_MAIN_REPO}"
     URL="$(installer_url "$REF")"

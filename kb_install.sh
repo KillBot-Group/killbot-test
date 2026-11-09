@@ -677,8 +677,26 @@ sudo apt update -y
 sudo apt install -y apache2 software-properties-common ca-certificates gnupg
 kb_install_patched_php
 
-# ping.txt exists only after a successful health check; it may be absent.
-sudo chown -R -h www-data:www-data /var/www/html 2>&1 | grep -vF 'ping.txt' || true
+# www-data may read the site. It must not create or overwrite files there.
+kb_lock_web_tree() {
+    local dir f
+    [ -d /var/www/html ] || return 0
+    chown -R -h root:root /var/www/html 2>&1 | grep -vF 'ping.txt' || true
+    find /var/www/html -type d -exec chmod 755 {} +
+    find /var/www/html -type f -exec chmod 644 {} +
+    for dir in /var/www/html /var/www/html/solver /var/www/html/solver_tools; do
+        [ -d "$dir" ] || continue
+        chown root:root "$dir"
+        chmod 755 "$dir"
+    done
+    for f in /var/www/html/solver_tools/settings.php /var/www/settings.php; do
+        if [ -f "$f" ]; then
+            chown root:www-data "$f"
+            chmod 640 "$f"
+        fi
+    done
+}
+kb_lock_web_tree
 
 sudo a2enmod ssl
 sudo a2enmod rewrite
@@ -2067,8 +2085,9 @@ FILE="/var/www/html/le_receive_cert.php"
         exit 1
     fi
 
-sudo chown www-data:www-data /var/www/html/le_receive_cert.php
+sudo chown root:root /var/www/html/le_receive_cert.php
 sudo chmod 644 /var/www/html/le_receive_cert.php
+kb_lock_web_tree
 
 FILE="/opt/killbot/check_killbot_reverse_proxy.sh"
     kb_download "$FILE" "sh/check_killbot_reverse_proxy.sh"
