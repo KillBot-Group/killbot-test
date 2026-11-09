@@ -3677,7 +3677,7 @@ KILLBOT_CERT_DELETE_SCRIPT="/opt/killbot/cert_delete.sh"
 SETTINGS_DIR="/opt/killbot/settings"
 KB_ENC_MOUNT_SCRIPT="/opt/killbot/install/kb_enc_mount_to_html_ram.sh"
 KB_HEALTH_CHECK_SCRIPT="/opt/killbot/server_health_check.sh"
-KB_HEALTH_STATUS_FILE="/var/www/html/data.killbot.ru/index.html"
+KB_HEALTH_STATUS_FILE="/var/www/html/solver/index.html"
 # Prefix for nginx reverse-proxy configs (loaded before *.domain)
 REVERSE_PROXY_NGINX_PREFIX="000-"
 
@@ -4130,6 +4130,9 @@ check_solver_health() {
     if [ ! -f "\$KB_HEALTH_CHECK_SCRIPT" ]; then
         return 0
     fi
+    if [ ! -d /var/www/html/solver ]; then
+        return 0
+    fi
     if [ ! -f "\$KB_HEALTH_STATUS_FILE" ]; then
         echo "Error: solver health status missing (\$KB_HEALTH_STATUS_FILE)."
         return 1
@@ -4137,7 +4140,7 @@ check_solver_health() {
     local body
     body=\$(tr -d '\\r\\n' < "\$KB_HEALTH_STATUS_FILE" 2>/dev/null || true)
     if [ "\$body" = "ok1." ]; then
-        echo "Solver health (data.killbot.ru/index.html): ok1."
+        echo "Solver health (/var/www/html/solver/index.html): ok1."
         return 0
     fi
     echo "Error: solver health check failed:"
