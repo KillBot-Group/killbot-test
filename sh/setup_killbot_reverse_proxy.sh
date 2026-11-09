@@ -1,0 +1,638 @@
+#!/bin/bash
+#
+# Reverse proxy for the site.
+#
+# Usage: sudo bash setup_killbot_reverse_proxy.sh [-y] SITE_DOMAIN
+#
+#   -y  skip the "Enter..." pause after instructions (unattended)
+#
+# /opt/killbot/killbot_revers                        — shared Killbot backends (created by kb_install.sh)
+# /opt/killbot/settings/SITE/killbot_revers          — rebuilt on every run: r1.SITE:backend, r2.SITE:backend, …
+# Nginx reverse proxy — only with a wildcard in /opt/killbot/ssl/SITE_DOMAIN/ (fullchain.pem + privkey.pem).
+# Nginx configs: /etc/nginx/sites-available/000-{proxy_fqdn}.conf (000- prefix — loaded before *.SITE)
+#
+set -euo pipefail
+
+require_kb_status() {
+    if [[ "${KB_STATUS_CHECKED:-0}" == "1" ]]; then
+        return 0
+    fi
+    local kb_bin=""
+    if command -v kb >/dev/null 2>&1; then
+        kb_bin="$(command -v kb)"
+    elif [[ -x /usr/local/bin/kb ]]; then
+        kb_bin="/usr/local/bin/kb"
+    elif [[ -x /etc/init.d/kb ]]; then
+        kb_bin="/etc/init.d/kb"
+    else
+        echo "ERROR: kb is not installed; aborting $(basename "$0")" >&2
+        exit 1
+    fi
+    echo "Checking kb status..."
+    if ! "$kb_bin" status; then
+        echo "ERROR: kb status failed; aborting $(basename "$0")" >&2
+        exit 1
+    fi
+    KB_STATUS_CHECKED=1
+    export KB_STATUS_CHECKED
+}
+
+require_kb_status
+
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _dns_hint in "${_SCRIPT_DIR}/dns_provider_hint.sh" "/opt/killbot/dns_provider_hint.sh"; do
+    if [[ -f "${_dns_hint}" ]]; then
+        # shellcheck source=dns_provider_hint.sh disable=SC1091
+        source "${_dns_hint}"
+        break
+    fi
+done
+unset _dns_hint
+
+# Check proxy A records only via a public resolver (Google DNS by default)
+DNSServer="${DNSServer:-8.8.8.8}"
+NGINX_SITES_AVAILABLE="${NGINX_SITES_AVAILABLE:-/etc/nginx/sites-available}"
+NGINX_SITES_ENABLED="${NGINX_SITES_ENABLED:-/etc/nginx/sites-enabled}"
+REVERSE_PROXY_CONF_PREFIX="${REVERSE_PROXY_CONF_PREFIX:-000-}"
+GLOBAL_BACKENDS_FILE="${GLOBAL_BACKENDS_FILE:-/opt/killbot/killbot_revers}"
+SETTINGS_BASE="${SETTINGS_BASE:-/opt/killbot/settings}"
+PROXY_LABEL_PREFIX="${PROXY_LABEL_PREFIX:-r}"
+AUTO_YES=0
+
+usage() {
+    echo "Usage: sudo bash $0 [-y] SITE_DOMAIN"
+    echo "  -y  skip the "Enter..." pause after instructions (unattended)"
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)
+            AUTO_YES=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "ERROR: unknown parameter: $1"
+            usage
+            ;;
+        *)
+            if [[ -n "${SITE_DOMAIN:-}" ]]; then
+                echo "ERROR: extra argument: $1"
+                usage
+            fi
+            SITE_DOMAIN="${1,,}"
+            SITE_DOMAIN="${SITE_DOMAIN#https://}"
+            SITE_DOMAIN="${SITE_DOMAIN#http://}"
+            SITE_DOMAIN="${SITE_DOMAIN%%/*}"
+            SITE_DOMAIN="${SITE_DOMAIN#www.}"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "${SITE_DOMAIN:-}" ]] || usage
+
+if [[ ! "$SITE_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    echo "ERROR: invalid domain: ${SITE_DOMAIN}"
+    exit 1
+fi
+
+SITE_DIR="${SETTINGS_BASE}/${SITE_DOMAIN}"
+SITE_REVERS="${SITE_DIR}/killbot_revers"
+SSL_KILLBOT_DIR="/opt/killbot/ssl/${SITE_DOMAIN}"
+SSL_CERT="${SSL_KILLBOT_DIR}/fullchain.pem"
+SSL_KEY="${SSL_KILLBOT_DIR}/privkey.pem"
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Run as root: sudo $0 SITE_DOMAIN"
+    exit 1
+fi
+
+for cmd in dig curl openssl; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: $cmd is required"; exit 1; }
+done
+
+site_killbot_ssl_cert_ok() {
+    [[ -f "${SSL_CERT}" && -f "${SSL_KEY}" ]]
+}
+
+site_killbot_ssl_wildcard_ok() {
+    site_killbot_ssl_cert_ok && is_wildcard_cert "${SSL_CERT}" "${SITE_DOMAIN}"
+}
+
+killbot_ssl_fail_reason() {
+    if ! site_killbot_ssl_cert_ok; then
+        echo "certificate not found in ${SSL_KILLBOT_DIR}/ (need fullchain.pem and privkey.pem)"
+        return 0
+    fi
+    echo "certificate found, but it is not a wildcard (*.${SITE_DOMAIN})"
+}
+
+remove_site_checked_file() {
+    local checked_file="${SITE_DIR}/killbot_revers_checked"
+    if [[ -f "$checked_file" ]]; then
+        rm -f "$checked_file"
+        echo "Removed ${checked_file}"
+    fi
+}
+
+fail_wildcard_cert_required() {
+    local reason="$1"
+    echo "ERROR: proxy subdomains require a wildcard certificate (*.${SITE_DOMAIN})." >&2
+    echo "       Place fullchain.pem and privkey.pem in the directory:" >&2
+    echo "       ${SSL_KILLBOT_DIR}/" >&2
+    if [[ -n "$reason" ]]; then
+        echo "       ${reason}" >&2
+    fi
+}
+
+remove_reverse_proxy_nginx_configs() {
+    local quiet="${1:-0}"
+    local skip_reload="${2:-0}"
+    [[ ${#SITE_PROXIES[@]} -gt 0 ]] || return 0
+
+    local proxy conf_name conf_path removed=0
+
+    for proxy in "${SITE_PROXIES[@]}"; do
+        [[ -n "$proxy" ]] || continue
+        conf_name="${REVERSE_PROXY_CONF_PREFIX}${proxy}.conf"
+        conf_path="${NGINX_SITES_AVAILABLE}/${conf_name}"
+
+        if [[ -f "${conf_path}" ]]; then
+            rm -f "${conf_path}"
+            [[ "$quiet" == "1" ]] || echo "Removed nginx config: ${conf_path}"
+            removed=1
+        fi
+        if [[ -f "${NGINX_SITES_ENABLED}/${conf_name}" || -L "${NGINX_SITES_ENABLED}/${conf_name}" ]]; then
+            rm -f "${NGINX_SITES_ENABLED}/${conf_name}"
+            [[ "$quiet" == "1" ]] || echo "Removed nginx enabled: ${NGINX_SITES_ENABLED}/${conf_name}"
+            removed=1
+        fi
+        # leftover configs without the 000- prefix
+        if [[ -f "${NGINX_SITES_AVAILABLE}/${proxy}.conf" ]]; then
+            rm -f "${NGINX_SITES_AVAILABLE}/${proxy}.conf"
+            removed=1
+        fi
+        if [[ -f "${NGINX_SITES_ENABLED}/${proxy}.conf" || -L "${NGINX_SITES_ENABLED}/${proxy}.conf" ]]; then
+            rm -f "${NGINX_SITES_ENABLED}/${proxy}.conf"
+            removed=1
+        fi
+    done
+
+    if [[ "$removed" -eq 1 ]]; then
+        NGINX_CHANGED=1
+        if [[ "$skip_reload" != "1" ]] && command -v nginx >/dev/null 2>&1; then
+            reload_nginx
+        fi
+    fi
+}
+
+ensure_killbot_wildcard_ssl_or_abort() {
+    local reason=""
+
+    if site_killbot_ssl_wildcard_ok; then
+        return 0
+    fi
+
+    reason="$(killbot_ssl_fail_reason)"
+    remove_reverse_proxy_nginx_configs
+    remove_site_checked_file
+    fail_wildcard_cert_required "$reason"
+    exit 1
+}
+
+# SAN *.domain in fullchain.pem
+is_wildcard_cert() {
+    local certfile="$1"
+    local domain="$2"
+    local n
+    if [[ ! -f "$certfile" ]]; then
+        return 1
+    fi
+    mapfile -t dns_entries < <(openssl x509 -in "$certfile" -noout -text 2>/dev/null | grep -oP 'DNS:[^,]+' | sed 's/^DNS://' || true)
+    for n in "${dns_entries[@]}"; do
+        if [[ "$n" == "*.${domain}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_server_public_ip() {
+    local ip
+    ip="$(curl -fsS --max-time 10 http://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "$ip"
+}
+
+dig_a_records() {
+    local domain="$1" line
+    while IFS= read -r line; do
+        line="$(echo "$line" | tr -d '\r' | tr -d '[:space:]')"
+        [[ -n "$line" && "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && echo "$line"
+    done < <(dig @"${DNSServer}" +short +time=5 +tries=2 "${domain}" A 2>/dev/null)
+}
+
+collect_a_ips() {
+    local domain="$1"
+    local -n _out=$2
+    _out=()
+    mapfile -t _out < <(dig_a_records "$domain")
+}
+
+a_list_contains_ip() {
+    local needle="$1"
+    shift
+    local ip
+    for ip in "$@"; do
+        [[ "$ip" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+format_a_ips_list() {
+    local -a ips=("$@")
+    if [[ ${#ips[@]} -eq 0 ]]; then
+        echo "(no A via @${DNSServer})"
+        return 0
+    fi
+    (IFS=', '; echo "${ips[*]}")
+}
+
+# One dig check per proxy: both log status and the result (no second pass)
+verify_all_proxies_dns() {
+    local server_ip="$1" proxy status resolved
+    local -a ips=()
+    local all_ok=1
+
+    DNS_OK_PROXIES=()
+    DNS_FAILED_PROXIES=()
+
+    [[ ${#SITE_PROXIES[@]} -gt 0 ]] || return 1
+
+    echo "DNS check via dig @${DNSServer} (A records must include ${server_ip}, extra A records are allowed):"
+    for proxy in "${SITE_PROXIES[@]}"; do
+        collect_a_ips "$proxy" ips
+        resolved="$(format_a_ips_list "${ips[@]}")"
+        if a_list_contains_ip "$server_ip" "${ips[@]}"; then
+            status="OK"
+            DNS_OK_PROXIES+=("$proxy")
+        else
+            status="FAIL"
+            all_ok=0
+            DNS_FAILED_PROXIES+=("$proxy")
+        fi
+        echo "  ${status}  ${proxy}  ->  ${resolved}"
+    done
+    echo
+
+    [[ "$all_ok" -eq 1 ]]
+}
+
+strip_scheme() {
+    local u="$1"
+    u="${u#https://}"; u="${u#http://}"; u="${u%%/*}"
+    echo "${u,,}"
+}
+
+ensure_global_backends() {
+    if [[ -s "${GLOBAL_BACKENDS_FILE}" ]]; then
+        return 0
+    fi
+    echo "ERROR: ${GLOBAL_BACKENDS_FILE} is missing or empty." >&2
+    echo "       Create it with Killbot backends (one host per line), then re-run." >&2
+    echo "       The installer writes the default list to this file." >&2
+    exit 1
+}
+
+read_global_backends() {
+    GLOBAL_BACKENDS=()
+    local line host
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | tr -d '[:space:]')"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == *:* ]]; then
+            host="$(strip_scheme "${line#*:}")"
+        else
+            host="$(strip_scheme "$line")"
+        fi
+        [[ -n "$host" ]] && GLOBAL_BACKENDS+=("$host")
+    done < "${GLOBAL_BACKENDS_FILE}"
+}
+
+read_site_proxies() {
+    SITE_PROXIES=()
+    local line proxy
+    [[ -s "${SITE_REVERS}" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(echo "$line" | tr -d '[:space:]')"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == *:* ]]; then
+            proxy="$(strip_scheme "${line%%:*}")"
+        else
+            proxy="$(strip_scheme "$line")"
+        fi
+        [[ -n "$proxy" ]] && SITE_PROXIES+=("$proxy")
+    done < "${SITE_REVERS}"
+}
+
+proxy_is_current() {
+    local needle="$1" proxy
+    for proxy in "${SITE_PROXIES[@]}"; do
+        [[ "$proxy" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# Drop nginx vhosts for this site that are no longer in the rebuilt map.
+remove_obsolete_site_nginx_configs() {
+    local conf_path conf_name proxy domain_re
+    local -a obsolete=()
+    local -a saved_proxies
+
+    domain_re="$(printf '%s' "$SITE_DOMAIN" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+
+    shopt -s nullglob
+    for conf_path in "${NGINX_SITES_AVAILABLE}/${REVERSE_PROXY_CONF_PREFIX}"*.conf "${NGINX_SITES_AVAILABLE}"/*.conf; do
+        [[ -f "$conf_path" ]] || continue
+        conf_name="$(basename "$conf_path" .conf)"
+        proxy="${conf_name#${REVERSE_PROXY_CONF_PREFIX}}"
+        if [[ "$proxy" =~ ^${PROXY_LABEL_PREFIX}[0-9]+\.${domain_re}$ ]]; then
+            if ! proxy_is_current "$proxy"; then
+                obsolete+=("$proxy")
+            fi
+        fi
+    done
+    shopt -u nullglob
+
+    for proxy in "${OLD_SITE_PROXIES[@]}"; do
+        [[ -n "$proxy" ]] || continue
+        if ! proxy_is_current "$proxy"; then
+            obsolete+=("$proxy")
+        fi
+    done
+
+    [[ ${#obsolete[@]} -gt 0 ]] || return 0
+
+    saved_proxies=("${SITE_PROXIES[@]}")
+    SITE_PROXIES=("${obsolete[@]}")
+    remove_reverse_proxy_nginx_configs 0 1
+    SITE_PROXIES=("${saved_proxies[@]}")
+}
+
+prune_site_checked_file() {
+    local checked_file="${SITE_DIR}/killbot_revers_checked"
+    local tmp line host kept=0
+    [[ -f "$checked_file" ]] || return 0
+
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        host="$(strip_scheme "$line")"
+        if proxy_is_current "$host"; then
+            printf '%s\n' "$line" >> "$tmp"
+            kept=1
+        fi
+    done < "$checked_file"
+
+    if [[ "$kept" -eq 0 ]]; then
+        rm -f "$checked_file" "$tmp"
+        echo "Removed ${checked_file}"
+    elif ! cmp -s "$tmp" "$checked_file"; then
+        mv -f "$tmp" "$checked_file"
+        echo "Updated ${checked_file}"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+write_site_revers_map() {
+    local -a backends=("${GLOBAL_BACKENDS[@]}")
+    local backend_host proxy_fqdn n=0
+
+    if [[ ${#backends[@]} -eq 0 ]]; then
+        echo "ERROR: empty ${GLOBAL_BACKENDS_FILE}"
+        exit 1
+    fi
+
+    mkdir -p "${SITE_DIR}"
+    : > "${SITE_REVERS}"
+    for backend_host in "${backends[@]}"; do
+        [[ -n "$backend_host" ]] || continue
+        n=$((n + 1))
+        proxy_fqdn="${PROXY_LABEL_PREFIX}${n}.${SITE_DOMAIN}"
+        echo "${proxy_fqdn}:${backend_host}" >> "${SITE_REVERS}"
+    done
+    chmod 644 "${SITE_REVERS}"
+}
+
+prepare_site_proxy_list() {
+    ensure_global_backends
+    read_global_backends
+    read_site_proxies
+    OLD_SITE_PROXIES=("${SITE_PROXIES[@]}")
+    write_site_revers_map
+    echo "Rebuilt ${SITE_REVERS} from ${GLOBAL_BACKENDS_FILE} (${#GLOBAL_BACKENDS[@]} backends)"
+}
+
+wait_for_enter() {
+    [[ "$AUTO_YES" == "1" ]] && return 0
+    if [[ -r /dev/tty ]]; then
+        read -r -p "Enter... " _ </dev/tty
+    else
+        read -r -p "Enter... " _ || true
+    fi
+}
+
+print_dns_instructions() {
+    local server_ip="$1"
+    local proxy dns_where=""
+
+    if declare -F dns_registrar_hint_ru >/dev/null 2>&1; then
+        dns_where="$(dns_registrar_hint_ru "${SITE_DOMAIN}")"
+        echo "${dns_where}."
+        echo
+    fi
+
+    echo "In DNS for domain ${SITE_DOMAIN} create the following subdomains"
+    echo "and add an A record to Killbot IP ${server_ip} (other A records to the same host are allowed):"
+    echo
+    for proxy in "${SITE_PROXIES[@]}"; do
+        echo "  ${proxy}  A  ${server_ip}"
+    done
+    echo
+    echo "Or a wildcard (one A ${server_ip} among *.${SITE_DOMAIN} records is enough):"
+    echo "  *.${SITE_DOMAIN}  A  ${server_ip}"
+    echo
+    echo "This hides Killbot behind your site domains."
+    echo "Subdomain names are fixed: ${PROXY_LABEL_PREFIX}1, ${PROXY_LABEL_PREFIX}2, … (see ${SITE_REVERS})."
+    echo "Format of ${SITE_REVERS}: proxy.${SITE_DOMAIN}:backend (for check_killbot_reverse_proxy.sh)."
+    echo
+    echo "Manual check: dig @${DNSServer} +short r1.${SITE_DOMAIN} A"
+    echo
+    echo "After DNS is set, run again:"
+    if [[ "$AUTO_YES" == "1" ]]; then
+        echo "  sudo bash $0 ${SITE_DOMAIN} -y"
+    else
+        echo "  sudo bash $0 ${SITE_DOMAIN}"
+    fi
+    echo
+    wait_for_enter
+}
+
+handle_proxies_dns_failure() {
+    local server_ip="$1"
+    local -a saved_proxies=("${SITE_PROXIES[@]}")
+
+    # Drop nginx only for names that fail DNS; keep working r1..rN in place.
+    if [[ ${#DNS_FAILED_PROXIES[@]} -gt 0 ]]; then
+        SITE_PROXIES=("${DNS_FAILED_PROXIES[@]}")
+        remove_reverse_proxy_nginx_configs 1
+        SITE_PROXIES=("${saved_proxies[@]}")
+    fi
+    if [[ ${#DNS_OK_PROXIES[@]} -eq 0 ]]; then
+        remove_site_checked_file
+    fi
+    print_dns_instructions "${server_ip}"
+    exit 0
+}
+
+parse_pair_line() {
+    local line="$1" proxy_var="$2" backend_var="$3"
+    local p b
+    line="${line%%#*}"
+    line="$(echo "$line" | tr -d '[:space:]')"
+    [[ -z "$line" || "$line" != *:* ]] && return 1
+    p="$(strip_scheme "${line%%:*}")"
+    b="$(strip_scheme "${line#*:}")"
+    [[ -z "$p" || -z "$b" ]] && return 1
+    printf -v "$proxy_var" '%s' "$p"
+    printf -v "$backend_var" '%s' "$b"
+}
+
+write_nginx_site() {
+    local proxy_fqdn="$1" backend_host="$2"
+    local conf_name="${REVERSE_PROXY_CONF_PREFIX}${proxy_fqdn}.conf"
+    local conf_path="${NGINX_SITES_AVAILABLE}/${conf_name}"
+    local enabled_path="${NGINX_SITES_ENABLED}/${conf_name}"
+    local legacy_path="${NGINX_SITES_AVAILABLE}/${proxy_fqdn}.conf"
+    local legacy_enabled="${NGINX_SITES_ENABLED}/${proxy_fqdn}.conf"
+    local tmp want_link=0
+
+    if [[ -f "${legacy_path}" ]]; then
+        rm -f "${legacy_path}"
+        NGINX_CHANGED=1
+    fi
+    if [[ -f "${legacy_enabled}" || -L "${legacy_enabled}" ]]; then
+        rm -f "${legacy_enabled}"
+        NGINX_CHANGED=1
+    fi
+
+    tmp="${conf_path}.tmp.$$"
+    cat > "${tmp}" <<EOF
+# ${proxy_fqdn} -> https://${backend_host}
+server {
+    listen 80;
+    server_name ${proxy_fqdn};
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name ${proxy_fqdn};
+    ssl_certificate     ${SSL_CERT};
+    ssl_certificate_key ${SSL_KEY};
+    location / {
+        proxy_pass https://${backend_host};
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${backend_host};
+        proxy_ssl_verify off;
+        proxy_set_header Host ${backend_host};
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+    if [[ -f "${conf_path}" ]] && cmp -s "${tmp}" "${conf_path}"; then
+        rm -f "${tmp}"
+    else
+        mv -f "${tmp}" "${conf_path}"
+        echo "Updated ${conf_path}"
+        NGINX_CHANGED=1
+    fi
+
+    if [[ ! -L "${enabled_path}" ]]; then
+        want_link=1
+    elif [[ "$(readlink -f "${enabled_path}" 2>/dev/null || true)" != "$(readlink -f "${conf_path}" 2>/dev/null || true)" ]]; then
+        want_link=1
+    fi
+    if [[ "$want_link" -eq 1 ]]; then
+        ln -sf "${conf_path}" "${enabled_path}"
+        NGINX_CHANGED=1
+    fi
+}
+
+apply_nginx() {
+    local line proxy backend
+    command -v nginx >/dev/null 2>&1 || { echo "ERROR: nginx is required"; exit 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_pair_line "$line" proxy backend || continue
+        write_nginx_site "$proxy" "$backend"
+    done < "${SITE_REVERS}"
+}
+
+reload_nginx() {
+    local nginx_check nginx_exit=0
+    nginx_check="$(nginx -t 2>&1)" || nginx_exit=$?
+    if [[ "$nginx_exit" -ne 0 ]] || ! echo "$nginx_check" | grep -qiE 'syntax is ok|test is successful'; then
+        echo "ERROR: nginx -t:"
+        echo "$nginx_check"
+        exit 1
+    fi
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+}
+
+GLOBAL_BACKENDS=()
+SITE_PROXIES=()
+OLD_SITE_PROXIES=()
+DNS_OK_PROXIES=()
+DNS_FAILED_PROXIES=()
+NGINX_CHANGED=0
+
+SERVER_IP="$(get_server_public_ip)"
+[[ -n "$SERVER_IP" ]] || { echo "ERROR: failed to detect the server IP"; exit 1; }
+
+mkdir -p "${SETTINGS_BASE}" "${NGINX_SITES_AVAILABLE}" "${NGINX_SITES_ENABLED}"
+
+prepare_site_proxy_list
+
+ensure_global_backends
+read_global_backends
+read_site_proxies
+remove_obsolete_site_nginx_configs
+prune_site_checked_file
+
+if [[ ${#SITE_PROXIES[@]} -eq 0 ]]; then
+    echo "ERROR: empty ${SITE_REVERS}"
+    remove_site_checked_file
+    exit 1
+fi
+
+if ! verify_all_proxies_dns "${SERVER_IP}"; then
+    handle_proxies_dns_failure "${SERVER_IP}"
+fi
+
+ensure_killbot_wildcard_ssl_or_abort
+
+apply_nginx
+if [[ "${NGINX_CHANGED}" -eq 1 ]]; then
+    reload_nginx
+    echo "OK ${SITE_DOMAIN} — nginx reverse proxy is configured, ${SITE_REVERS}"
+else
+    echo "OK ${SITE_DOMAIN} — nginx reverse proxy unchanged, skip reload (${#SITE_PROXIES[@]} proxies, ${SITE_REVERS})"
+fi

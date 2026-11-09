@@ -1,0 +1,7191 @@
+#!/bin/bash
+#yes '' | sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a ./kb_install.sh
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+#ServerLimit 64
+MAX_CONNECTIONS=5000
+
+#MaxRequestWorkers 4096
+MAX_CONNECTIONS_WORKERS=5000
+
+MAX_OPEN_FILES=1000000
+MAX_OPEN_FILES_SYS=3000000
+MAX_PROCESSES=20000
+KILLBOT_SESSION_LIFETIME=86400 #sec
+
+set -e # Exit immediately if any command fails
+
+# Optional git ref for raw downloads (branch, tag, or commit).
+# UpdateAll.sh passes KB_GIT_REF. Default is the test branch while we debug.
+if [[ -z "${KB_GIT_REF:-}" && -n "${1:-}" && "$1" != -* ]]; then
+  KB_GIT_REF="$1"
+fi
+KB_GIT_REF="${KB_GIT_REF:-test}"
+if [[ ! "$KB_GIT_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$KB_GIT_REF" == *..* ]]; then
+  echo "ERROR: invalid KB_GIT_REF: ${KB_GIT_REF}"
+  exit 1
+fi
+KB_GIT_RAW="https://raw.githubusercontent.com/grigoriy-melnikov/KillBot/${KB_GIT_REF}"
+
+kb_download() {
+  local dest="$1"
+  local path="$2"
+  local url="${KB_GIT_RAW}/${path}"
+  if ! timeout 15 curl --connect-timeout 10 -f -L -H "Cache-Control: no-cache" -H "Pragma: no-cache" -o "$dest" "$url"; then
+    echo "ERROR: download failed: $url" >&2
+    return 1
+  fi
+}
+
+# sudo resets the environment, so NEEDRESTART_* from the launch command never
+# reaches apt. The "Pending kernel upgrade" whiptail then hangs on `yes '' |`.
+sudo() {
+    command sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 "$@"
+}
+
+# sysctl -p/--system exits non-zero if a key has no /proc node (typical when
+# IPv6 is already off via ipv6.disable=1). Do not abort the installer.
+kb_sysctl_p() {
+    if ! sudo sysctl -p; then
+        echo "Warning: some sysctl keys could not be applied (missing in this kernel). Continuing."
+    fi
+}
+
+kb_sysctl_system() {
+    if ! sysctl --system; then
+        echo "Warning: some sysctl keys could not be applied (missing in this kernel). Continuing."
+    fi
+}
+
+# MPTCP: turn multipath TCP off now and keep it off after reboot.
+# A kernel without net.mptcp.enabled has no MPTCP; that is already safe.
+kb_disable_mptcp() {
+    local conf="/etc/sysctl.d/99-disable-mptcp.conf"
+    local current=""
+    echo "Disabling MPTCP (net.mptcp.enabled=0)..."
+    sudo mkdir -p /etc/sysctl.d
+    echo "net.mptcp.enabled = 0" | sudo tee "$conf" >/dev/null
+    if sudo sysctl -w net.mptcp.enabled=0 >/dev/null 2>&1; then
+        echo "MPTCP disabled in the running kernel."
+    else
+        echo "Warning: net.mptcp.enabled is absent in this kernel (MPTCP not present). Continuing."
+    fi
+    if sudo sysctl net.mptcp.enabled >/dev/null 2>&1; then
+        current="$(sudo sysctl -n net.mptcp.enabled 2>/dev/null || true)"
+        echo "net.mptcp.enabled = ${current:-unknown}"
+        if [ "$current" != "0" ]; then
+            echo "Warning: MPTCP is still enabled."
+        fi
+    else
+        echo "This kernel has no MPTCP sysctl (already safe)."
+    fi
+    return 0
+}
+kb_disable_mptcp
+
+# PHP2Shell (CVE-2026-109618, CVE-2026-109619): unauthenticated RCE in the
+# interpreter. Fixed in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. PHP 8.1 is EOL
+# and is not patched. Ubuntu 22.04 ships 8.1, so KillBot installs a patched
+# series from ppa:ondrej/php and runs Apache mpm_prefork + matching mod_php.
+KB_PHP_SERIES=""
+
+kb_php_release() {
+    local bin="${1:-php}"
+    "$bin" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION.".".PHP_RELEASE_VERSION;' 2>/dev/null || true
+}
+
+kb_php_is_patched() {
+    local ver="$1"
+    [[ -n "$ver" ]] || return 1
+    case "$ver" in
+        8.5.*) dpkg --compare-versions "$ver" ge "8.5.12" ;;
+        8.4.*) dpkg --compare-versions "$ver" ge "8.4.27" ;;
+        8.3.*) dpkg --compare-versions "$ver" ge "8.3.36" ;;
+        8.2.*) dpkg --compare-versions "$ver" ge "8.2.35" ;;
+        *) return 1 ;;
+    esac
+}
+
+kb_php_upstream_from_deb() {
+    echo "${1:-}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+kb_php_candidate_version() {
+    apt-cache policy "libapache2-mod-php${1}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}'
+}
+
+# Ondrej publishes jammy/noble only. Interim Ubuntu (plucky, questing, …)
+# gets a source file with no Release; point it at noble instead of dropping
+# the PPA — otherwise PHP2Shell-patched packages are unavailable.
+kb_php_rewrite_ondrej_suite() {
+    local suite="${1:-noble}"
+    local f found=0
+    local nullglob_was=0
+    shopt -q nullglob && nullglob_was=1
+    shopt -s nullglob
+    for f in /etc/apt/sources.list.d/*ondrej*php* /etc/apt/sources.list.d/*ondrej-ubuntu-php*; do
+        [ -f "$f" ] || continue
+        found=1
+        sudo sed -i -E \
+            -e "s/^(Suites:[[:space:]]*).*/\\1${suite}/" \
+            -e "s#(ondrej/php/ubuntu[/]*)[[:space:]]+[A-Za-z0-9]+#\\1 ${suite}#" \
+            "$f"
+    done
+    [ "$nullglob_was" -eq 1 ] || shopt -u nullglob
+    [ "$found" -eq 1 ]
+}
+
+kb_enable_ondrej_php_ppa() {
+    echo "Enabling ppa:ondrej/php for patched PHP packages..."
+    sudo apt-get install -y software-properties-common ca-certificates gnupg
+    sudo add-apt-repository -y universe || true
+    if ! sudo add-apt-repository -y ppa:ondrej/php; then
+        echo "WARNING: could not add ppa:ondrej/php; trying Ubuntu packages only."
+        sudo apt-get update -y || true
+        return 1
+    fi
+    if sudo apt-get update -y; then
+        echo "ppa:ondrej/php is enabled."
+        return 0
+    fi
+    echo "WARNING: ppa:ondrej/php has no packages for Ubuntu ${OS_VERSION}; using noble."
+    if kb_php_rewrite_ondrej_suite noble && sudo apt-get update -y; then
+        echo "ppa:ondrej/php is enabled (noble packages on Ubuntu ${OS_VERSION})."
+        return 0
+    fi
+    echo "WARNING: ppa:ondrej/php noble packages failed to load; removing it."
+    sudo add-apt-repository -y --remove ppa:ondrej/php || true
+    sudo apt-get update -y || true
+    return 1
+}
+
+kb_php_pick_series() {
+    local series cand up preferred seen=""
+    local -a order=()
+    preferred="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+    case "$preferred" in
+        8.2|8.3|8.4|8.5) order+=("$preferred") ;;
+    esac
+    case "${OS_VERSION}" in
+        22.04|24.04) order+=(8.3 8.4 8.5 8.2) ;;
+        25.04|25.10) order+=(8.4 8.3 8.5 8.2) ;;
+        26.04) order+=(8.5 8.4 8.3 8.2) ;;
+        *) order+=(8.3 8.4 8.5 8.2) ;;
+    esac
+    for series in "${order[@]}"; do
+        [[ " $seen " == *" $series "* ]] && continue
+        seen+=" $series"
+        cand="$(kb_php_candidate_version "$series")"
+        [[ -n "$cand" && "$cand" != "(none)" ]] || continue
+        up="$(kb_php_upstream_from_deb "$cand")"
+        if kb_php_is_patched "$up"; then
+            echo "$series"
+            return 0
+        fi
+        echo "Skipping PHP ${series}: apt candidate ${cand} is not patched (need 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12)." >&2
+    done
+    return 1
+}
+
+kb_php_load_so() {
+    local load="/etc/apache2/mods-available/php${1}.load"
+    [[ -f "$load" ]] || return 1
+    awk '/^[[:space:]]*LoadModule[[:space:]]/ {print $3; exit}' "$load" | tr -d '"'
+}
+
+kb_php_apache_module_ready() {
+    local series="$1" so_path
+    [[ -n "$series" && -f "/etc/apache2/mods-available/php${series}.load" ]] || return 1
+    so_path="$(kb_php_load_so "$series")"
+    [[ -n "$so_path" && -f "$so_path" ]]
+}
+
+kb_apache_use_prefork() {
+    sudo a2dismod mpm_event 2>/dev/null || true
+    sudo a2dismod mpm_worker 2>/dev/null || true
+    if ! sudo a2enmod mpm_prefork; then
+        echo "ERROR: could not enable Apache mpm_prefork (required for mod_php)" >&2
+        exit 1
+    fi
+}
+
+# Drop every Apache php*.load / php*.conf except php${keep_series}.
+# keep_series may be empty (disable all) so this is safe before the
+# new libapache2-mod-phpX.Y package is installed.
+# apt must not start Apache while the old .so is gone and php8.1.load
+# is still enabled (Ubuntu 22.04 postrm of libapache2-mod-php8.1).
+kb_apache_freeze_service() {
+    trap kb_apache_unfreeze_service EXIT
+    sudo tee /usr/sbin/policy-rc.d >/dev/null <<'EOF'
+#!/bin/sh
+case "$1" in
+    apache2|apache2.service) exit 101 ;;
+esac
+exit 0
+EOF
+    sudo chmod 755 /usr/sbin/policy-rc.d
+    sudo systemctl stop apache2 2>/dev/null || true
+}
+
+kb_apache_unfreeze_service() {
+    sudo rm -f /usr/sbin/policy-rc.d
+}
+
+kb_php_disable_other_apache_modules() {
+    local keep_series="${1:-}"
+    local keep="" load leftover mod ver ng=0
+    [[ -n "$keep_series" ]] && keep="php${keep_series}"
+    sudo a2dismod php 2>/dev/null || true
+    for ver in 8.0 8.1 8.2 8.3 8.4 8.5 8.6; do
+        if [[ -z "$keep_series" || "$ver" != "$keep_series" ]]; then
+            sudo a2dismod "php${ver}" 2>/dev/null || true
+        fi
+    done
+    shopt -q nullglob && ng=1
+    shopt -s nullglob
+    for load in /etc/apache2/mods-available/php*.load /etc/apache2/mods-enabled/php*.load; do
+        [[ -e "$load" || -L "$load" ]] || continue
+        mod="$(basename "$load" .load)"
+        if [[ -z "$keep" || "$mod" != "$keep" ]]; then
+            sudo a2dismod "$mod" 2>/dev/null || true
+        fi
+    done
+    for leftover in /etc/apache2/mods-enabled/php*.load /etc/apache2/mods-enabled/php*.conf; do
+        [[ -e "$leftover" || -L "$leftover" ]] || continue
+        mod="$(basename "$leftover")"
+        mod="${mod%.load}"
+        mod="${mod%.conf}"
+        if [[ -z "$keep" || "$mod" != "$keep" ]]; then
+            echo "Removing leftover Apache PHP module link: $leftover"
+            sudo rm -f "$leftover"
+        fi
+    done
+    [[ "$ng" -eq 1 ]] || shopt -u nullglob
+}
+
+# remove leaves /etc/apache2/mods-available/php8.1.load as a conffile;
+# later apt (lua, security2) then a2enmod php8.1 again with no .so.
+kb_php_remove_other_mod_packages() {
+    local series="$1" pkg ver
+    kb_apache_freeze_service
+    for pkg in $(dpkg-query -W -f='${Package}\n' 'libapache2-mod-php*' 2>/dev/null || true); do
+        if [[ "$pkg" != "libapache2-mod-php${series}" ]]; then
+            sudo apt-get purge -y "$pkg" || true
+        fi
+    done
+    for ver in 8.0 8.1 8.2 8.3 8.4 8.5 8.6; do
+        if [[ "$ver" != "$series" ]]; then
+            sudo rm -f \
+                "/etc/apache2/mods-enabled/php${ver}.load" \
+                "/etc/apache2/mods-enabled/php${ver}.conf" \
+                "/etc/apache2/mods-available/php${ver}.load" \
+                "/etc/apache2/mods-available/php${ver}.conf"
+        fi
+    done
+    sudo rm -f /etc/apache2/mods-enabled/php.load /etc/apache2/mods-enabled/php.conf
+    kb_php_disable_other_apache_modules "$series"
+    kb_apache_unfreeze_service
+}
+
+# Enable exactly one Apache mod_php. apt remove of libapache2-mod-php8.1
+# deletes libphp8.1.so but often leaves mods-enabled/php8.1.load.
+kb_php_enable_apache_module() {
+    local series="$1"
+    local so_path enabled load ng=0
+    if [[ -z "$series" ]]; then
+        echo "ERROR: kb_php_enable_apache_module: empty PHP series" >&2
+        exit 1
+    fi
+    if ! kb_php_apache_module_ready "$series"; then
+        echo "ERROR: Apache module php${series} is missing (.load or .so). Install libapache2-mod-php${series}." >&2
+        exit 1
+    fi
+
+    kb_apache_use_prefork
+    kb_php_disable_other_apache_modules "$series"
+
+    so_path="$(kb_php_load_so "$series")"
+    sudo a2enmod "php${series}"
+
+    enabled=0
+    shopt -q nullglob && ng=1
+    shopt -s nullglob
+    for load in /etc/apache2/mods-enabled/php*.load; do
+        enabled=$((enabled + 1))
+    done
+    [[ "$ng" -eq 1 ]] || shopt -u nullglob
+    if [[ "$enabled" -ne 1 ]] || [[ ! -e "/etc/apache2/mods-enabled/php${series}.load" ]]; then
+        echo "ERROR: expected only mods-enabled/php${series}.load, found:" >&2
+        ls -l /etc/apache2/mods-enabled/php* 2>/dev/null || true
+        exit 1
+    fi
+    echo "Enabled Apache module: php${series} only (${so_path})"
+}
+
+kb_apache_configtest() {
+    if ! sudo apache2ctl -t; then
+        echo "ERROR: apache2ctl -t failed. Enabled PHP modules:" >&2
+        ls -l /etc/apache2/mods-enabled/php* 2>/dev/null || true
+        exit 1
+    fi
+}
+
+kb_apache_restart() {
+    kb_apache_unfreeze_service
+    if [[ -n "${KB_PHP_SERIES:-}" ]]; then
+        kb_php_enable_apache_module "$KB_PHP_SERIES"
+    fi
+    kb_apache_configtest
+    if ! sudo systemctl restart apache2; then
+        echo "ERROR: apache2 failed to start." >&2
+        sudo apache2ctl -t || true
+        ls -l /etc/apache2/mods-enabled/php* 2>/dev/null || true
+        sudo systemctl status apache2 --no-pager || true
+        exit 1
+    fi
+}
+
+kb_php_install_extensions() {
+    local series="$1"
+    local pkg
+    for pkg in \
+        "php${series}-mbstring" \
+        "php${series}-xml" \
+        "php${series}-mysql" \
+        "php${series}-zip" \
+        "php${series}-gd" \
+        "php${series}-curl"
+    do
+        sudo apt-get install -y "$pkg"
+    done
+    sudo apt-get install -y "php${series}-json" 2>/dev/null || true
+    if [ -x /usr/sbin/phpenmod ]; then
+        sudo phpenmod -v "$series" mbstring xml mysqli pdo_mysql zip gd curl 2>/dev/null || true
+    fi
+}
+
+kb_php_use_cli() {
+    local series="$1"
+    if [[ -x "/usr/bin/php${series}" ]]; then
+        sudo update-alternatives --install /usr/bin/php php "/usr/bin/php${series}" 83 >/dev/null 2>&1 || true
+        sudo update-alternatives --set php "/usr/bin/php${series}" || true
+    fi
+}
+
+# Ondrej 8.3+ ships OPcache JIT. Ubuntu 8.1 did not. With mpm_prefork
+# MaxRequestWorkers in the thousands, JIT compile of BF.php burns every core
+# until the user a2enmod php8.1 again. Keep OPcache, turn JIT off.
+kb_php_disable_jit() {
+    local series="$1" sapi
+    [[ -n "$series" ]] || return 0
+    for sapi in apache2 cli; do
+        sudo mkdir -p "/etc/php/${series}/${sapi}/conf.d"
+        sudo tee "/etc/php/${series}/${sapi}/conf.d/99-killbot-no-jit.ini" >/dev/null <<'EOF'
+; KillBot: disable JIT only. OPcache stays on.
+opcache.enable=1
+opcache.jit=disable
+opcache.jit_buffer_size=0
+EOF
+    done
+    echo "PHP ${series} JIT disabled (opcache stays on)."
+}
+
+kb_install_patched_php() {
+    local series cand php_ver pkg
+    php_ver="$(kb_php_release)"
+    # Ubuntu 22.04 with patched 8.3 already: only switch Apache to that
+    # series. If CLI is 8.3 but libapache2-mod-php8.3 was removed, install it.
+    if kb_php_is_patched "$php_ver"; then
+        series="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+        if [[ -n "$series" ]] && kb_php_apache_module_ready "$series"; then
+            KB_PHP_SERIES="$series"
+            echo "PHP ${php_ver} is already patched for PHP2Shell (CVE-2026-109618 / CVE-2026-109619). Skipping PHP repo and reinstall."
+            kb_php_disable_jit "$series"
+            kb_php_enable_apache_module "$series"
+            kb_php_remove_other_mod_packages "$series"
+            kb_php_enable_apache_module "$series"
+            kb_apache_configtest
+            return 0
+        fi
+        echo "PHP ${php_ver} is patched but Apache module php${series:-?} is missing. Installing matching libapache2-mod-php..."
+    else
+        echo "PHP ${php_ver:-not installed} is vulnerable or missing. Installing patched PHP (PHP2Shell CVE-2026-109618 / CVE-2026-109619)..."
+    fi
+
+    kb_enable_ondrej_php_ppa || true
+
+    series="$(kb_php_pick_series || true)"
+    if [[ -z "$series" ]]; then
+        echo "ERROR: no patched PHP package is available (need 8.2.35+, 8.3.36+, 8.4.27+, or 8.5.12+)." >&2
+        echo "Ubuntu ${OS_VERSION} archive PHP is not patched. Enable ppa:ondrej/php (noble fallback on non-LTS) and retry." >&2
+        php -v 2>/dev/null || true
+        exit 1
+    fi
+    cand="$(kb_php_candidate_version "$series")"
+    echo "Installing PHP ${series} (candidate ${cand}) with Apache mpm_prefork + libapache2-mod-php${series}..."
+
+    kb_apache_use_prefork
+    kb_php_disable_other_apache_modules "$series"
+    kb_apache_freeze_service
+
+    sudo apt-get install -y "php${series}" "php${series}-cli" "libapache2-mod-php${series}"
+    kb_php_use_cli "$series"
+    kb_php_install_extensions "$series"
+    kb_php_disable_jit "$series"
+    kb_apache_unfreeze_service
+    kb_php_enable_apache_module "$series"
+    kb_php_remove_other_mod_packages "$series"
+    kb_php_enable_apache_module "$series"
+
+    php_ver="$(kb_php_release)"
+    if ! kb_php_is_patched "$php_ver" && [[ -x "/usr/bin/php${series}" ]]; then
+        php_ver="$(kb_php_release "/usr/bin/php${series}")"
+        kb_php_use_cli "$series"
+    fi
+    echo "PHP CLI: $(php -v 2>/dev/null | head -n 1)"
+    if ! kb_php_is_patched "$php_ver"; then
+        echo "ERROR: PHP ${php_ver:-not installed} is still vulnerable to PHP2Shell." >&2
+        echo "Required: 8.2.35, 8.3.36, 8.4.27, or 8.5.12 (or newer in that series). PHP 8.1 is not supported." >&2
+        exit 1
+    fi
+    KB_PHP_SERIES="$series"
+    echo "PHP ${php_ver} is patched. Apache module: php${series}"
+    kb_apache_restart
+}
+
+# Distro nginx on Ubuntu 22.04 is 1.18 (critical CVEs). Official stable is 1.30.x
+# (http2 on; not listen ... ssl http2). Skip if already 1.26+.
+kb_nginx_version() {
+    nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+kb_nginx_is_current() {
+    local ver="$1"
+    [[ -n "$ver" ]] || return 1
+    dpkg --compare-versions "$ver" ge "1.26.0"
+}
+
+kb_nginx_ubuntu_codename() {
+    case "${OS_VERSION:-}" in
+        22.04) echo jammy ;;
+        24.04) echo noble ;;
+        25.04) echo plucky ;;
+        25.10) echo questing ;;
+        26.04) echo resolute ;;
+        *) lsb_release -cs 2>/dev/null || echo jammy ;;
+    esac
+}
+
+kb_enable_nginx_official_repo() {
+    local codename keyring listfile pinfile
+    sudo apt-get install -y curl gnupg ca-certificates lsb-release
+    keyring="/usr/share/keyrings/nginx-archive-keyring.gpg"
+    listfile="/etc/apt/sources.list.d/nginx.list"
+    pinfile="/etc/apt/preferences.d/99nginx"
+    curl -fsSL https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor | sudo tee "$keyring" >/dev/null
+    sudo chmod 644 "$keyring"
+    if ! gpg --dry-run --quiet --no-keyring --import --import-options import-show "$keyring" 2>/dev/null \
+        | grep -q "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"; then
+        echo "ERROR: nginx.org signing key fingerprint mismatch." >&2
+        return 1
+    fi
+    codename="$(kb_nginx_ubuntu_codename)"
+    if ! curl -fsSL "https://nginx.org/packages/ubuntu/dists/${codename}/InRelease" >/dev/null 2>&1; then
+        echo "WARNING: nginx.org has no ${codename} packages; using noble."
+        codename="noble"
+    fi
+    echo "deb [signed-by=${keyring}] https://nginx.org/packages/ubuntu ${codename} nginx" | sudo tee "$listfile" >/dev/null
+    printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' | sudo tee "$pinfile" >/dev/null
+    sudo apt-get update -y
+    echo "nginx.org stable repo enabled (${codename})."
+}
+
+kb_nginx_ensure_sites_enabled() {
+    local conf="/etc/nginx/nginx.conf"
+    sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/conf.d
+    if [ -f "$conf" ] && ! grep -qE 'include[[:space:]]+/etc/nginx/sites-enabled' "$conf"; then
+        if grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' "$conf"; then
+            sudo sed -i 's|include[[:space:]]\+/etc/nginx/conf\.d/\*\.conf;|include /etc/nginx/conf.d/*.conf;\n    include /etc/nginx/sites-enabled/*;|' "$conf"
+        else
+            echo "WARNING: $conf has no sites-enabled include — add it inside http { } manually."
+        fi
+    fi
+}
+
+kb_install_current_nginx() {
+    local ver
+    ver="$(kb_nginx_version)"
+    if kb_nginx_is_current "$ver"; then
+        echo "nginx ${ver} is new enough (need 1.26+). Skipping nginx.org repo."
+        kb_nginx_ensure_sites_enabled
+        return 0
+    fi
+
+    echo "nginx ${ver:-not installed} is outdated (Ubuntu 22.04 ships 1.18 with critical CVEs). Installing official stable from nginx.org..."
+    kb_enable_nginx_official_repo
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confold" install nginx
+    kb_nginx_ensure_sites_enabled
+    ver="$(kb_nginx_version)"
+    if ! kb_nginx_is_current "$ver"; then
+        echo "ERROR: nginx ${ver:-not installed} is still below 1.26 after the official-repo install." >&2
+        nginx -v >&2 || true
+        exit 1
+    fi
+    echo "nginx ${ver} installed from nginx.org stable."
+}
+
+sudo mkdir -p /etc/needrestart/conf.d
+sudo tee /etc/needrestart/conf.d/zzz-killbot.conf > /dev/null <<'NREOF'
+$nrconf{restart} = 'a';
+$nrconf{kernelhints} = 0;
+$nrconf{ucodehints} = 0;
+NREOF
+
+sudo apt update
+
+rm -rf /var/log/apache2/*
+rm -rf /var/log/killbot/*
+
+# flush iptables if any subnets were blocked
+if [ -f /opt/killbot/f2b/subnet-monitor.sh ]; then
+  chmod +x /opt/killbot/f2b/subnet-monitor.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/subnet-monitor.sh clear || true
+fi
+
+# unblock traffic if anything is still blocked
+if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
+  chmod +x /opt/killbot/f2b/unblock_traffic.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/unblock_traffic.sh || true
+fi
+
+sudo apt install -y needrestart
+
+# Path to the configuration file
+CONFIG_FILE="/etc/needrestart/needrestart.conf"
+
+# Check whether the file exists
+if [ -f "$CONFIG_FILE" ]; then
+    # Make a backup (just in case)
+    sudo cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
+    
+    # Check whether a $nrconf{restart} line exists
+    if grep -q '^\s*$nrconf{restart}' "$CONFIG_FILE"; then
+        # If present — replace it (commented or active)
+        sudo sed -i 's/^\s*$nrconf{restart}.*/$nrconf{restart} = '"'a'"';/' "$CONFIG_FILE"
+        echo "$nrconf{restart} line updated to '$nrconf{restart} = 'a';'"
+    else
+        # If missing — append at the end
+        echo '$nrconf{restart} = '\''a'\'';' | sudo tee -a "$CONFIG_FILE" > /dev/null
+        echo "$nrconf{restart} = 'a' appended at the end of the file"
+    fi
+else
+    # If the file is missing — create it with the required line
+    echo '$nrconf{restart} = '\''a'\'';' | sudo tee "$CONFIG_FILE" > /dev/null
+    echo "File $CONFIG_FILE created with the required setting"
+fi
+
+sudo apt install lsb-release -y
+
+sudo apt install -y socat curl zip unzip
+
+
+CURRENT_SERVER_IP=$(curl -s http://checkip.amazonaws.com)
+CURRENT_SERVER_IP="${CURRENT_SERVER_IP//$'\r'/}"
+CURRENT_SERVER_IP="${CURRENT_SERVER_IP//$'\n'/}"
+CURRENT_SERVER_IP="${CURRENT_SERVER_IP// /}"
+#echo "Current server IP: $CURRENT_SERVER_IP"
+
+#Get information about the Ubuntu version
+OS_ID=$(lsb_release -is)
+OS_VERSION=$(lsb_release -rs)
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run with sudo!"
+    exit 1
+fi
+
+kb_current_hostname() {
+    hostname -s 2>/dev/null || hostname
+}
+
+kb_apply_hostname() {
+    local new="$1"
+    hostnamectl set-hostname "$new"
+    if [ -f /etc/hosts ]; then
+        if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+            sed -i -E "s/^127\\.0\\.1\\.1.*/127.0.1.1 ${new}/" /etc/hosts
+        else
+            echo "127.0.1.1 ${new}" >> /etc/hosts
+        fi
+    fi
+    echo "Hostname set to ${new}"
+}
+
+# Check that the system is a supported Ubuntu release
+if [[ "$OS_ID" == "Ubuntu" ]] && [[ "$OS_VERSION" == "22.04" || "$OS_VERSION" == "24.04" || "$OS_VERSION" == "25.04" || "$OS_VERSION" == "25.10" || "$OS_VERSION" == "26.04" ]]; then
+    echo "Running on Ubuntu $OS_VERSION is allowed."
+else
+    echo "Error: The script can only run on Ubuntu 22.04, 24.04, 25.04, 25.10, or 26.04 (detected: ${OS_ID} ${OS_VERSION})."
+    exit 1
+fi
+
+sudo apt update -y
+
+sudo apt install -y apache2 software-properties-common ca-certificates gnupg
+kb_install_patched_php
+
+# ping.txt exists only after a successful health check; it may be absent.
+sudo chown -R -h www-data:www-data /var/www/html 2>&1 | grep -vF 'ping.txt' || true
+
+sudo a2enmod ssl
+sudo a2enmod rewrite
+sudo a2enmod proxy
+sudo a2enmod proxy_http
+sudo a2enmod headers
+sudo a2enmod remoteip
+sudo a2enmod setenvif
+sudo tee /etc/apache2/conf-available/killbot-logformat.conf > /dev/null <<'EOF'
+# combined + kbRes kbUserID kbSession kbCheck (NONE if the cookie is missing)
+SetEnvIf Request_URI "^" KB_LOG_KBRES=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBUSERID=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBSESSION=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBCHECK=NONE
+SetEnvIf Cookie "(?:^|;\s*)kbRes=([^;]+)" KB_LOG_KBRES=$1
+SetEnvIf Cookie "(?:^|;\s*)kbUserID=([^;]+)" KB_LOG_KBUSERID=$1
+SetEnvIf Cookie "(?:^|;\s*)kbSession=([^;]+)" KB_LOG_KBSESSION=$1
+SetEnvIf Cookie "(?:^|;\s*)kbCheck=([^;]+)" KB_LOG_KBCHECK=$1
+
+LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\" %{KB_LOG_KBRES}e %{KB_LOG_KBUSERID}e %{KB_LOG_KBSESSION}e %{KB_LOG_KBCHECK}e" combined_kb
+EOF
+sudo a2enconf killbot-logformat >/dev/null
+#sudo a2dismod status
+sudo apt install logrotate -y
+sudo apt install libapache2-mod-security2 -y
+
+sudo apt install cron -y
+sudo systemctl enable cron
+sudo systemctl start cron
+
+#close mail service
+sudo systemctl stop postfix || true
+sudo systemctl disable postfix || true
+
+sudo apt install ipset -y
+
+kb_install_current_nginx
+
+sudo apt install openssl -y
+
+rm -rf /var/log/nginx/*
+
+NGINX_CONF="/etc/nginx/nginx.conf"
+NEW_LINE="access_log /var/log/nginx/access.log;"
+OLD_LINE="access_log /var/log/apache2/nginx.access.log;"
+
+if grep -qF "$OLD_LINE" "$NGINX_CONF"; then
+    echo "[*] Found access_log line. Replacing..."
+    # make a backup
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)"
+    # replace
+    sed -i "s|$OLD_LINE|$NEW_LINE|g" "$NGINX_CONF"
+    echo "[OK] Line replaced"
+else
+    echo "[*] Line not found, no changes needed"
+fi
+
+OLD_LINE="access_log /var/log/apache2/access-nginx.log;"
+
+if grep -qF "$OLD_LINE" "$NGINX_CONF"; then
+    echo "[*] Found access_log line. Replacing..."
+    # make a backup
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%s)"
+    # replace
+    sed -i "s|$OLD_LINE|$NEW_LINE|g" "$NGINX_CONF"
+    echo "[OK] Line replaced"
+else
+    echo "[*] Line not found, no changes needed"
+fi
+
+SUBNET_MONITOR_CONF="/opt/killbot/f2b/subnet-monitor.conf"
+# In sed, * in the pattern is a regex metacharacter; grep -qF finds the line, but sed then does not match.
+# Replace line-by-line by exact match (awk) so the *access*.log mask is treated literally.
+OLD_LINE='LOG_FILES="/var/log/apache2/*access*.log"'
+NEW_LINE='LOG_FILES="/var/log/nginx/access.log"'
+
+if [[ -f "$SUBNET_MONITOR_CONF" ]] && grep -qF "$OLD_LINE" "$SUBNET_MONITOR_CONF"; then
+    echo "[*] Found *access*.log in subnet-monitor.conf — changing to nginx.access.log"
+    cp "$SUBNET_MONITOR_CONF" "${SUBNET_MONITOR_CONF}.bak.$(date +%s)"
+    _sm_tmp="${SUBNET_MONITOR_CONF}.tmp.$$"
+    awk -v old="$OLD_LINE" -v new="$NEW_LINE" '{ if ($0 == old) print new; else print }' "$SUBNET_MONITOR_CONF" > "$_sm_tmp" && mv "$_sm_tmp" "$SUBNET_MONITOR_CONF"
+    echo "[OK] Line replaced"
+else
+    echo "[*] *access*.log not found in subnet-monitor.conf, no changes needed"
+fi
+unset _sm_tmp
+
+OLD_LINE='LOG_FILES="/var/log/apache2/nginx.access.log"'
+NEW_LINE='LOG_FILES="/var/log/nginx/access.log"'
+
+if [[ -f "$SUBNET_MONITOR_CONF" ]] && grep -qF "$OLD_LINE" "$SUBNET_MONITOR_CONF"; then
+    echo "[*] Found *access*.log in subnet-monitor.conf — changing to nginx.access.log"
+    cp "$SUBNET_MONITOR_CONF" "${SUBNET_MONITOR_CONF}.bak.$(date +%s)"
+    _sm_tmp="${SUBNET_MONITOR_CONF}.tmp.$$"
+    awk -v old="$OLD_LINE" -v new="$NEW_LINE" '{ if ($0 == old) print new; else print }' "$SUBNET_MONITOR_CONF" > "$_sm_tmp" && mv "$_sm_tmp" "$SUBNET_MONITOR_CONF"
+    echo "[OK] Line replaced"
+else
+    echo "[*] *access*.log not found in subnet-monitor.conf, no changes needed"
+fi
+unset _sm_tmp
+
+OLD_LINE='LOG_FILES="/var/log/apache2/access-nginx.log"'
+NEW_LINE='LOG_FILES="/var/log/nginx/access.log"'
+
+if [[ -f "$SUBNET_MONITOR_CONF" ]] && grep -qF "$OLD_LINE" "$SUBNET_MONITOR_CONF"; then
+    echo "[*] Found *access*.log in subnet-monitor.conf — changing to nginx.access.log"
+    cp "$SUBNET_MONITOR_CONF" "${SUBNET_MONITOR_CONF}.bak.$(date +%s)"
+    _sm_tmp="${SUBNET_MONITOR_CONF}.tmp.$$"
+    awk -v old="$OLD_LINE" -v new="$NEW_LINE" '{ if ($0 == old) print new; else print }' "$SUBNET_MONITOR_CONF" > "$_sm_tmp" && mv "$_sm_tmp" "$SUBNET_MONITOR_CONF"
+    echo "[OK] Line replaced"
+else
+    echo "[*] *access*.log not found in subnet-monitor.conf, no changes needed"
+fi
+unset _sm_tmp
+
+
+NGINX_CONF="/etc/nginx/nginx.conf"
+
+# Check for a line without combined
+if grep -qE '^[[:space:]]*access_log[[:space:]]+/var/log/nginx/access\.log;[[:space:]]*$' "$NGINX_CONF"; then
+
+    echo "Found access_log without combined. Fixing..."
+
+    sed -i -E \
+    's|^[[:space:]]*access_log[[:space:]]+/var/log/nginx/access\.log;[[:space:]]*$|    access_log /var/log/nginx/access.log combined;|g' \
+    "$NGINX_CONF"
+
+    echo "Done."
+
+else
+    echo "No changes needed."
+fi
+
+
+
+[ "$EUID" -ne 0 ] && echo "Root privileges required" && exit 1
+NGINX_CONF="/etc/nginx/nginx.conf"
+
+if ! grep -q "map \$request \$trash_request" "$NGINX_CONF"; then
+    cp "$NGINX_CONF" "${NGINX_CONF}.backup"
+    sed -i '/http {/a\
+    map \$request \$trash_request {\
+        default                                     0;\
+        "~\\\\x16\\\\x03"                               1;  # SSL handshake\
+        "~OPTIONS \\*"                               1;  # OPTIONS *\
+        "~^[[:cntrl:]]"                             1;  # Control characters\
+    }' "$NGINX_CONF"
+    echo "✅ trash_request added"    
+fi
+
+# Add a directive only if it is missing
+add_if_missing() {
+    local search_pattern="$1"
+    local line_to_add="$2"
+    
+    if ! grep -q "$search_pattern" "$NGINX_CONF"; then
+        sed -i "/http {/a \\    $line_to_add" "$NGINX_CONF"
+        echo "✅ Added: $line_to_add"
+    else
+        echo "⏭️  Already exists: $search_pattern"
+    fi
+}
+
+replace_if_not_equal() {
+    local old_string="$1"
+    local new_string="$2"
+
+    # Already replaced
+    if grep -Eq "^[[:space:]]*$(printf '%s' "$new_string" | sed 's/[][\/.^$*+?|(){}]/\\&/g')[[:space:]]*$" "$NGINX_CONF"; then        
+        return 0
+    fi
+
+    # Whether there is a line to replace
+    if grep -Eq "^[[:space:]]*$(printf '%s' "$old_string" | sed 's/[][\/.^$*+?|(){}]/\\&/g')[[:space:]]*$" "$NGINX_CONF"; then
+
+        local escaped_old
+        local escaped_new
+
+        escaped_old=$(printf '%s' "$old_string" | sed 's/[\/&|]/\\&/g')
+        escaped_new=$(printf '%s' "$new_string" | sed 's/[\/&|]/\\&/g')
+
+        sed -i "s|^[[:space:]]*$escaped_old[[:space:]]*$|$escaped_new|" "$NGINX_CONF"
+        return 0
+    fi
+
+    # Old line is missing — not an error; the caller may add new_string via add_if_missing
+    return 0
+}
+
+# Add directives
+replace_if_not_equal "worker_connections 768;" "worker_connections 5000;"
+add_if_missing "server_names_hash_bucket_size" "server_names_hash_bucket_size 128;"
+add_if_missing "client_max_body_size" "client_max_body_size 256M;"
+
+#add_if_missing "zone=conn_per_ip" "limit_conn_zone \$binary_remote_addr zone=conn_per_ip:10m;"
+#add_if_missing "zone=req_per_ip" "limit_req_zone \$binary_remote_addr zone=req_per_ip:10m rate=50r/s;"
+#add_if_missing "limit_conn conn_per_ip" "limit_conn conn_per_ip 50;"
+#add_if_missing "limit_req zone=req_per_ip" "limit_req zone=req_per_ip burst=100 nodelay;"
+
+
+add_if_missing "charset" "charset off;"
+add_if_missing "proxy_buffer_size" "proxy_buffer_size 128k;"
+add_if_missing "proxy_buffers" "proxy_buffers 8 256k;"
+#add_if_missing "proxy_busy_buffers_size" "proxy_busy_buffers_size 64k;"
+
+add_if_missing "map_hash_bucket_size" "map_hash_bucket_size 64;"
+add_if_missing "map_hash_max_size" "map_hash_max_size 4096;"
+add_if_missing "server_names_hash_bucket_size" "server_names_hash_bucket_size 128;"
+add_if_missing "server_names_hash_max_size" "server_names_hash_max_size 8192;"
+
+#add_if_missing 'limit_req_status' 'limit_req_status 444;'
+
+replace_if_not_equal 'limit_req_status 444;' 'limit_req_status 429;'
+add_if_missing 'limit_req_status' 'limit_req_status 429;'
+
+ERROR_PAGES_INC="/etc/nginx/conf.d/killbot-too-many-requests.inc"
+mkdir -p "$(dirname "$ERROR_PAGES_INC")"
+cat > "$ERROR_PAGES_INC" << 'EOF'
+error_page 429 /too_many_requests.html;
+location = /too_many_requests.html {
+    internal;
+    root /opt/killbot/html;
+}
+EOF
+chmod 644 "$ERROR_PAGES_INC"
+echo "✅ Created ${ERROR_PAGES_INC}"
+
+# SQL injection maps belong in http{} (conf.d). Server blocks only include the deny snippet.
+kb_write_nginx_sqli_conf() {
+    sudo mkdir -p /etc/nginx/conf.d /etc/nginx/snippets /var/log/nginx
+    sudo tee /etc/nginx/conf.d/sql_injection.conf >/dev/null << 'EOF'
+# ============================================================
+# SQL INJECTION PROTECTION FOR NGINX
+# ============================================================
+
+# UNION SELECT, UNION ALL SELECT
+map $request_uri $sqli_union {
+    default 0;
+    "~*union(?:\s|%20|\+)+(?:all(?:\s|%20|\+)+)?select" 1;
+}
+
+# Time-based SQL injection
+map $request_uri $sqli_time {
+    default 0;
+    "~*(?:sleep|benchmark|pg_sleep)\s*(?:\(|%28)" 1;
+    "~*waitfor(?:\s|%20|\+)+delay" 1;
+}
+
+# SQL system tables and schemas
+map $request_uri $sqli_schema {
+    default 0;
+    "~*information_schema" 1;
+    "~*mysql(?:\.|%2e)user" 1;
+    "~*pg_catalog" 1;
+}
+
+# Dangerous SQL functions
+map $request_uri $sqli_functions {
+    default 0;
+    "~*(?:load_file|extractvalue|updatexml)\s*(?:\(|%28)" 1;
+    "~*into(?:\s|%20|\+)+(?:out|dump)file" 1;
+}
+
+# Boolean-based SQL injection
+map $request_uri $sqli_boolean {
+    default 0;
+    "~*(?:%27|%22|')(?:\s|%20|\+)*(?:or|and)(?:\s|%20|\+)+(?:[0-9]+(?:\s|%20|\+)*=(?:\s|%20|\+)*[0-9]+)" 1;
+    "~*(?:%27|')(?:\s|%20|\+)*or(?:\s|%20|\+)+(?:%27|')?[a-z0-9]+(?:%27|')?=(?:%27|')?[a-z0-9]+" 1;
+}
+
+# Stacked SQL queries
+map $request_uri $sqli_stacked {
+    default 0;
+    "~*(?:;|%3b)(?:\s|%20|\+)*(?:drop|truncate|alter|delete|insert|update)(?:\s|%20|\+)+" 1;
+}
+
+# SQL comments combined with suspicious statements
+map $request_uri $sqli_comments {
+    default 0;
+    "~*(?:--|%2d%2d|%23|%2f%2a).*(?:union|select|sleep|benchmark)" 1;
+}
+
+# Combine all detection rules
+map "$sqli_union:$sqli_time:$sqli_schema:$sqli_functions:$sqli_boolean:$sqli_stacked:$sqli_comments" $sql_injection {
+    default 0;
+    "~1" 1;
+}
+
+# Enable separate logging only for detected requests
+map $sql_injection $sql_injection_log {
+    0 0;
+    1 1;
+}
+
+# SQL injection log format
+log_format sql_attack
+    '$time_iso8601 '
+    'ip=$remote_addr '
+    'forwarded="$http_x_forwarded_for" '
+    'host="$host" '
+    'method="$request_method" '
+    'uri="$request_uri" '
+    'status=$status '
+    'user_agent="$http_user_agent"';
+
+# Separate log file
+access_log /var/log/nginx/sql_injection.log sql_attack if=$sql_injection_log;
+EOF
+    sudo tee /etc/nginx/snippets/sql-injection.conf >/dev/null << 'EOF'
+# $sql_injection is set by /etc/nginx/conf.d/sql_injection.conf (http context).
+if ($sql_injection) {
+    return 403;
+}
+EOF
+    sudo chmod 644 /etc/nginx/conf.d/sql_injection.conf /etc/nginx/snippets/sql-injection.conf
+    echo "SQL injection nginx rules: /etc/nginx/conf.d/sql_injection.conf"
+}
+
+# Block download of .svn, .git and other hidden paths. ACME stays reachable.
+kb_write_block_hidden_files_snippet() {
+    sudo mkdir -p /etc/nginx/snippets
+    sudo tee /etc/nginx/snippets/block-hidden-files.conf >/dev/null << 'EOF'
+# Block hidden files and directories, including nested paths.
+# Keep ACME challenges accessible.
+location ~ (^|/)\.(?!well-known(?:/|$)) {
+    return 403;
+}
+EOF
+    sudo chmod 644 /etc/nginx/snippets/block-hidden-files.conf
+}
+kb_write_nginx_sqli_conf
+kb_write_block_hidden_files_snippet
+
+add_if_missing 'limit_req zone=per_host' 'limit_req zone=per_host burst=150 nodelay;'
+add_if_missing 'limit_req_zone "\$host"' 'limit_req_zone "\$host" zone=per_host:40m rate=500r/s;'
+
+add_if_missing 'limit_req zone=per_url' 'limit_req zone=per_url burst=50 nodelay;'
+add_if_missing 'limit_req_zone "\$host\$uri"' 'limit_req_zone "\$host\$uri" zone=per_url:10m rate=200r/m;'
+
+
+
+replace_if_not_equal 'ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3; # Dropping SSLv3, ref: POODLE' 'ssl_protocols TLSv1.2;'      
+
+CONF_DIR="/etc/nginx/conf.d"
+CONF_FILE="${CONF_DIR}/killbot-block-params.conf"
+NGINX_CONF="/etc/nginx/nginx.conf"
+
+# 0=off, 1=on
+KB_BLOCK_IF_HAS_BLOCKED_PARAM=0   # 1: a forbidden query parameter is present
+KB_BLOCK_IF_NO_PARAMS=0           # 2: query string is empty
+KB_BLOCK_IF_HAS_ANY_PARAM=0       # 3: any query parameter is present
+KB_BLOCK_IF_NO_ALLOWED_PARAMS=0   # 4: none of the allowed parameters are present
+KB_BLOCK_IF_BAD_PATH=1            # 5: URI (path) matched a forbidden prefix/pattern
+KB_BLOCK_IF_BAD_HOST=0            # 6: Host is in the forbidden list
+
+# Path list for condition 5: prefixes without domain, without query.
+# Each item is a literal prefix; the map will compile it as ^/iemgroup($|/) and so on.
+KB_BLOCKED_PATHS=(
+	"/AISURUbotnetproxy"
+	"/russialoshara"
+	"/qratorloshara"
+	"/fuckyoumom"
+	"/iemgroup"
+)
+
+# Host list for condition 6 (exact host match, case-insensitive via ~*):
+KB_BLOCKED_HOSTS=(
+	"example.com"
+)
+
+mkdir -p "$CONF_DIR"
+
+# Build one regex from the prefix list (escape for regex)
+build_path_regex() {
+	local parts=()
+	local p esc
+	for p in "$@"; do
+		[ -z "$p" ] && continue
+		p="${p#/}"
+		esc=$(printf '%s' "$p" | sed 's/[].[^$\\*+?{}|()]/\\&/g')
+		parts+=("^/${esc}(\$|/)")
+	done
+	if [ "${#parts[@]}" -eq 0 ]; then
+		return 1
+	fi
+	local IFS='|'
+	printf '%s' "${parts[*]}"
+}
+
+PATH_REGEX=""
+if PATH_REGEX="$(build_path_regex "${KB_BLOCKED_PATHS[@]}")"; then
+	:
+else
+	PATH_REGEX=""
+fi
+
+PATH_MAP_LINES='    default 0;'
+if [ -n "$PATH_REGEX" ]; then
+	PATH_MAP_LINES="    default 0;
+    ~*(${PATH_REGEX}) 1;"
+fi
+
+# Build one regex from the host list (escape for regex)
+build_host_regex() {
+	local parts=()
+	local h esc
+	for h in "$@"; do
+		[ -z "$h" ] && continue
+		esc=$(printf '%s' "$h" | sed 's/[].[^$\\*+?{}|()]/\\&/g')
+		parts+=("${esc}")
+	done
+	if [ "${#parts[@]}" -eq 0 ]; then
+		return 1
+	fi
+	local IFS='|'
+	printf '%s' "${parts[*]}"
+}
+
+HOST_REGEX=""
+if HOST_REGEX="$(build_host_regex "${KB_BLOCKED_HOSTS[@]}")"; then
+	:
+else
+	HOST_REGEX=""
+fi
+
+HOST_MAP_LINES='    default 0;'
+if [ -n "$HOST_REGEX" ]; then
+	HOST_MAP_LINES="    default 0;
+    ~*^(${HOST_REGEX})\$ 1;"
+fi
+
+cat > "$CONF_FILE" <<EOF
+# ${CONF_FILE}
+# Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Auto-block by query string and by path (before further proxying).
+
+map \$args \$kb_has_blocked_param {
+    default 0;
+    ~*(^|&)(utm_term|mclkid|_ga|_gl|gclid|utm_source|utm_medium|utm_campaign|yclid|fbclid|_openstat|ref)(&|=|$) 1;
+}
+
+map \$args \$kb_no_params {
+    ""      1;
+    default 0;
+}
+
+map \$args \$kb_has_any_param {
+    ""      0;
+    default 1;
+}
+
+map \$args \$kb_has_allowed_param {
+    default 0;
+    ~*(^|&)(id|page|q|s|sort|order|category|product_id)(&|=|$) 1;
+}
+
+# Condition 5: path (normalized URI without query)
+map \$uri \$kb_has_blocked_path {
+${PATH_MAP_LINES}
+}
+
+# Condition 6: host is in the list
+map \$host \$kb_has_blocked_host {
+${HOST_MAP_LINES}
+}
+
+# Toggles (0/1). Off by default.
+# Example of enabling for a specific domain:
+# Set the domain that should enable this block. If you set "default 1;", the block is enabled for all domains.
+# Example:   
+#map \$host \$kb_block_if_bad_path         { # 5: URI (path) matched a forbidden prefix/pattern
+#    default 0;
+#    futbolki.tv 1;
+#}  
+# So for domain futbolki.tv the block is enabled when "URI (path) matched a forbidden prefix/pattern".
+
+map \$host \$kb_block_if_has_blocked_param { # 1: a forbidden query parameter is present
+    default 0;
+    test-killbot.local 1;
+}
+map \$host \$kb_block_if_no_params        { # 2: query string is empty
+    default 0;
+    test-killbot.local 0;
+}
+map \$host \$kb_block_if_has_any_param    { # 3: any query parameter is present
+    default 0;
+    test-killbot.local 0;
+}
+map \$host \$kb_block_if_no_allowed       { # 4: none of the allowed parameters are present
+    default 0;
+    test-killbot.local 0;
+}
+map \$host \$kb_block_if_bad_path         { # 5: URI (path) matched a forbidden prefix/pattern
+    default 0;
+    test-killbot.local 1;
+}   
+map \$host \$kb_block_if_bad_host         { # 6: Host is in the forbidden list
+    default 0;
+    test-killbot.local 0;
+}
+
+# Result: 1 = block (any enabled condition)
+map "\$kb_block_if_has_blocked_param:\$kb_block_if_no_params:\$kb_block_if_has_any_param:\$kb_block_if_no_allowed:\$kb_block_if_bad_path:\$kb_block_if_bad_host:\$kb_has_blocked_param:\$kb_no_params:\$kb_has_any_param:\$kb_has_allowed_param:\$kb_has_blocked_path:\$kb_has_blocked_host" \$kb_should_block {
+    default 0;
+    # 1) enabled and a forbidden query parameter was found
+    ~^1:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1: 1;
+
+    # 2) enabled and query is empty
+    ~^[^:]*:1:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1: 1;
+
+    # 3) enabled and query is NOT empty
+    ~^[^:]*:[^:]*:1:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1: 1;
+
+    # 4) enabled, query is NOT empty, and there are NO allowed parameters
+    ~^[^:]*:[^:]*:[^:]*:1:[^:]*:[^:]*:[^:]*:[^:]*:1:0: 1;
+
+    # 5) enabled and the path is forbidden
+    ~^[^:]*:[^:]*:[^:]*:[^:]*:1:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1: 1;
+
+    # 6) enabled and the host is forbidden
+    ~^[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:1\$ 1;
+}
+
+# In server{} / location / before proxy_pass:
+#   if (\$kb_should_block) { return 403; }
+EOF
+
+tmp="$(mktemp)"
+awk -v a="${KB_BLOCK_IF_HAS_BLOCKED_PARAM}" \
+	-v b="${KB_BLOCK_IF_NO_PARAMS}" \
+	-v c="${KB_BLOCK_IF_HAS_ANY_PARAM}" \
+	-v d="${KB_BLOCK_IF_NO_ALLOWED_PARAMS}" \
+	-v e="${KB_BLOCK_IF_BAD_PATH}" \
+	-v f="${KB_BLOCK_IF_BAD_HOST}" '
+{
+  # Do not use the name "in" — in awk it is a keyword and breaks parsing.
+  if ($0 ~ /^map \$host \$kb_block_if_has_blocked_param/) { print; st1=1; next }
+  if (st1==1 && $0 ~ /^    default /) { print "    default " a ";"; st1=0; next }
+
+  if ($0 ~ /^map \$host \$kb_block_if_no_params/) { print; st2=1; next }
+  if (st2==1 && $0 ~ /^    default /) { print "    default " b ";"; st2=0; next }
+
+  if ($0 ~ /^map \$host \$kb_block_if_has_any_param/) { print; st3=1; next }
+  if (st3==1 && $0 ~ /^    default /) { print "    default " c ";"; st3=0; next }
+
+  if ($0 ~ /^map \$host \$kb_block_if_no_allowed/) { print; st4=1; next }
+  if (st4==1 && $0 ~ /^    default /) { print "    default " d ";"; st4=0; next }
+
+  if ($0 ~ /^map \$host \$kb_block_if_bad_path/) { print; st5=1; next }
+  if (st5==1 && $0 ~ /^    default /) { print "    default " e ";"; st5=0; next }
+
+  if ($0 ~ /^map \$host \$kb_block_if_bad_host/) { print; st6=1; next }
+  if (st6==1 && $0 ~ /^    default /) { print "    default " f ";"; st6=0; next }
+
+  print
+}' "$CONF_FILE" > "$tmp"
+mv "$tmp" "$CONF_FILE"
+chmod 0644 "$CONF_FILE"
+
+if [ -f "$NGINX_CONF" ] && ! grep -qE 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' "$NGINX_CONF"; then
+	echo "Warning: $NGINX_CONF has no include /etc/nginx/conf.d/*.conf — add it inside http { } manually."
+fi
+
+echo "Written: $CONF_FILE"
+
+# Path to the configuration file
+PORTS_CONF="/etc/apache2/ports.conf"
+
+# Check that the file exists and contains a port 8443 line
+if [ -f "$PORTS_CONF" ] && grep -q "8443" "$PORTS_CONF"; then
+    echo "File $PORTS_CONF already has a port 8443 config. Nothing to do."
+else
+    echo "Creating a new $PORTS_CONF with the required config..."
+    
+    # Create a backup if the file exists
+    if [ -f "$PORTS_CONF" ]; then
+        cp "$PORTS_CONF" "$PORTS_CONF.backup.$(date +%Y%m%d_%H%M%S)"
+        echo "Backup of the existing file created"
+    fi
+    
+    # Create a new file with the required contents
+    cat > "$PORTS_CONF" << 'EOF'
+Listen 127.0.0.1:8080 backlog=65535
+Listen 127.0.0.1:8443 backlog=65535
+EOF
+    
+    echo "File $PORTS_CONF was created/updated with the following contents:"
+    echo "----------------------------------------"
+    cat "$PORTS_CONF"
+    echo "----------------------------------------"
+fi
+
+# so Apache receives the real client IP
+sudo a2enmod remoteip
+CONFIG_FILE="/etc/apache2/apache2.conf"
+if ! grep -q "RemoteIPHeader X-Forwarded-For" "$CONFIG_FILE"; then
+    echo "RemoteIPHeader X-Forwarded-For" | sudo tee -a "$CONFIG_FILE"
+fi
+if ! grep -q "RemoteIPTrustedProxy 127.0.0.1" "$CONFIG_FILE"; then
+    echo "RemoteIPTrustedProxy 127.0.0.1" | sudo tee -a "$CONFIG_FILE"
+fi
+if ! grep -qE '^[[:space:]]*ListenBacklog[[:space:]]' "$CONFIG_FILE"; then
+    echo "ListenBacklog 4096" | sudo tee -a "$CONFIG_FILE"
+fi
+kb_apache_restart
+
+sudo sudo tee /etc/nginx/sites-available/$CURRENT_SERVER_IP.conf > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $CURRENT_SERVER_IP;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+
+    # uncomment this during a DDoS
+    #return 444;
+
+    if (\$trash_request = 1) {
+        return 444;
+    }
+
+    if (\$server_protocol = "HTTP/1.3") {
+        return 444;
+    }
+
+    #if (\$args ~ .+) { return 444; }  # block if there is at least one query parameter (useful during DDoS)
+    
+    #if (\$args ~ (^|&)(param1|param2|param3)(=|&|\$)) { return 444; } # block if a query parameter is one of param1,param2,param3 (useful during DDoS)
+
+    location /server-status {
+        if (\$kb_should_block) { return 444; }
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host "127.0.0.1";
+        proxy_buffering off;
+        allow 127.0.0.1;        
+        deny all;
+    }
+
+    location / {
+        if (\$kb_should_block) { return 444; }
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+      #  proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $CURRENT_SERVER_IP;
+
+    ssl_certificate      /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+
+    if (\$trash_request = 1) {
+        return 444;
+    }
+
+    if (\$server_protocol = "HTTP/1.3") {
+        return 444;
+    }
+
+    location / {
+        if (\$kb_should_block) { return 444; }
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+sudo ln -sf /etc/nginx/sites-available/$CURRENT_SERVER_IP.conf /etc/nginx/sites-enabled/
+
+sudo sudo tee /etc/nginx/sites-available/default > /dev/null <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+
+    # uncomment this during a DDoS
+    #return 444;
+
+    if (\$trash_request = 1) {
+        return 444;
+    }
+
+    if (\$server_protocol = "HTTP/1.3") {
+        return 444;
+    }
+
+    #if (\$args ~ .+) { return 444; }  # block if there is at least one query parameter (useful during DDoS)
+    
+    #if (\$args ~ (^|&)(param1|param2|param3)(=|&|\$)) { return 444; } # block if a query parameter is one of param1,param2,param3 (useful during DDoS)
+
+
+    location /server-status {
+        if (\$kb_should_block) { return 444; }
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host "127.0.0.1";
+        proxy_buffering off;
+        allow 127.0.0.1;        
+        deny all;
+    }
+
+    if (\$http_host = "") {
+        return 444;
+    }
+
+#    if (\$http_host ~* "^[0-9\.]+$") {
+#        return 444;
+#    }
+
+    if (\$http_host ~* "example\.ru") {
+        return 444;
+    }
+
+    location / {
+
+        if (\$kb_should_block) { return 444; }
+
+        if (\$request_method = OPTIONS) {
+            return 444;
+        }
+
+        if (\$http_host = "") {
+            return 444;
+        }
+
+#        if (\$http_host ~* "^[0-9\.]+$") {
+#            return 444;
+#        }
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+       # proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+        # For all remaining junk
+        #return 444;
+    }
+}
+
+server {
+    listen 443 ssl default_server;    
+    server_name _;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+
+    # uncomment this during a DDoS
+    #return 444;
+
+    #if (\$args ~ .+) { return 444; }  # block if there is at least one query parameter (useful during DDoS)
+    
+    #if (\$args ~ (^|&)(param1|param2|param3)(=|&|\$)) { return 444; } # block if a query parameter is one of param1,param2,param3 (useful during DDoS)
+
+    if (\$trash_request = 1) {
+        return 444;
+    }
+
+    if (\$server_protocol = "HTTP/1.3") {
+        return 444;
+    }
+
+    if (\$http_host = "") {
+        return 444;
+    }
+
+#    if (\$http_host ~* "^[0-9\.]+$") {
+#        return 444;
+#    }
+
+    if (\$http_host ~* "example\.ru") {
+        return 444;
+    }
+
+    # SSL certificates
+    ssl_certificate      /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    
+    location / {
+
+        if (\$kb_should_block) { return 444; }
+
+        proxy_ssl_server_name on;
+        proxy_ssl_name \$host;
+        proxy_ssl_verify off;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass https://127.0.0.1:8443;
+        proxy_set_header Host \$host;
+        #proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        #proxy_set_header X-Forwarded-Proto \$scheme;
+        #proxy_set_header X-Forwarded-Host \$host;
+        #proxy_set_header X-Forwarded-Port \$server_port;
+    } 
+
+    # Redirect back to HTTP
+    # return 301 http://\$host\$request_uri;
+}
+
+EOF
+
+
+sudo sudo tee /etc/apache2/sites-available/000-default.conf > /dev/null <<EOF
+<VirtualHost 127.0.0.1:8080>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html
+
+    RewriteEngine On
+
+    # === 2. Block OPTIONS ===
+    RewriteCond %{REQUEST_METHOD} ^OPTIONS$
+    RewriteRule ^ - [F]
+
+    # === 3. Block empty Host ===
+    RewriteCond %{HTTP_HOST} ^$
+    RewriteRule ^ - [F]
+
+    RewriteCond %{REQUEST_URI} !^/kb.php$
+    RewriteCond %{REQUEST_URI} !^/le_receive_cert.php$
+    RewriteCond %{REQUEST_URI} !^/empty.php$
+    RewriteCond %{REQUEST_URI} !^/le_custom_server/request.php$
+    RewriteRule ^ /empty.php [L]
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+
+</VirtualHost>
+<VirtualHost 127.0.0.1:8443>
+    ServerName $CURRENT_SERVER_IP
+    ServerAlias 127.0.0.1 localhost
+
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html
+
+    RewriteEngine On
+
+    # === 2. Block OPTIONS ===
+    RewriteCond %{REQUEST_METHOD} ^OPTIONS$
+    RewriteRule ^ - [F]
+
+    # === 3. Block empty Host ===
+    RewriteCond %{HTTP_HOST} ^$
+    RewriteRule ^ - [F]
+
+    RewriteCond %{REQUEST_URI} !^/kb.php$
+    RewriteCond %{REQUEST_URI} !^/le_receive_cert.php$
+    RewriteCond %{REQUEST_URI} !^/empty.php$
+    RewriteCond %{REQUEST_URI} !^/le_custom_server/request.php$
+    RewriteRule ^ /empty.php [L]
+
+    SSLEngine on
+
+    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8080>
+    ServerName $CURRENT_SERVER_IP
+    DocumentRoot /var/www/html
+
+    RewriteEngine On
+
+    RewriteCond %{REQUEST_METHOD} ^OPTIONS
+
+    RewriteRule .* - [R=403,L]
+
+  <Directory "/var/www/html">
+        Require all denied
+        <Files "kb.php">
+            Require all granted
+        </Files>
+        <Files "le_receive_cert.php">
+            Require all granted
+        </Files>
+    </Directory>
+</VirtualHost>
+<VirtualHost 127.0.0.1:8443>
+    ServerName $CURRENT_SERVER_IP
+    ServerAlias 127.0.0.1 localhost
+    DocumentRoot /var/www/html
+
+    SSLEngine on
+    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+
+    RewriteEngine On
+    RewriteCond %{REQUEST_METHOD} ^OPTIONS
+    RewriteRule .* - [R=403,L]
+
+    <Directory "/var/www/html">
+        Require all denied
+        <Files "kb.php">
+            Require all granted
+        </Files>
+        <Files "le_receive_cert.php">
+            Require all granted
+        </Files>
+    </Directory>
+</VirtualHost>
+EOF
+
+# 000-default-ssl is first in sites-enabled and becomes the default SSL vhost.
+# A leftover ServerName like \$SERVER_IP makes every HTTPS-to-Apache :8443
+# return 421 (SNI/Host mismatch). 000-default.conf already has :8443.
+sudo a2dissite 000-default-ssl >/dev/null 2>&1 || true
+
+kb_sysctl_system
+sysctl net.ipv4.tcp_syncookies net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_synack_retries || true
+
+sudo a2enmod security2
+sudo a2enmod reqtimeout
+#sudo apt install lua-md5
+#sudo apt install luarocks
+#sudo luarocks install md5
+#sudo a2enmod lua
+
+sudo mkdir -p /var/log/apache2/
+sudo chown -R www-data:www-data /var/log/apache2/
+sudo chmod -R 755 /var/log/apache2/
+
+#sudo mkdir -p /var/www/html/webroot
+#sudo chown -R www-data:www-data /var/www/html/webroot
+
+#####################
+# Patched PHP (libapache2-mod-php) + mpm_prefork. No php-fpm / mpm_event.
+echo "Configuring Apache mpm_prefork with patched mod_php..."
+sudo a2dismod proxy_fcgi 2>/dev/null || true
+for fpm_conf in /etc/apache2/conf-enabled/php*-fpm.conf; do
+    [[ -e "$fpm_conf" ]] || continue
+    sudo a2disconf "$(basename "$fpm_conf" .conf)" || true
+done
+if [[ -z "${KB_PHP_SERIES:-}" ]]; then
+    echo "ERROR: patched PHP series was not selected" >&2
+    exit 1
+fi
+kb_php_enable_apache_module "$KB_PHP_SERIES"
+echo "Enabled Apache module: php${KB_PHP_SERIES} (mpm_prefork, only this series)"
+
+# kb.php / le_receive_cert.php run under Apache and call exec/shell_exec/passthru.
+# solver installer may have put those in apache2/php.ini; take them out so both
+# installers can share a host. CLI php.ini is never touched (Lua verification.php).
+kb_php_keep_kb_php_functions() {
+    local ini fn
+    for ini in /etc/php/*/apache2/php.ini; do
+        [ -f "$ini" ] || continue
+        sudo php /dev/stdin "$ini" <<'PHP'
+<?php
+$ini = $argv[1];
+$src = file_get_contents($ini);
+if ($src === false || !preg_match('/^\s*disable_functions\s*=\s*(.*)$/m', $src, $m)) {
+    exit(0);
+}
+$keep = array('exec' => true, 'shell_exec' => true, 'passthru' => true);
+$out = array();
+$removed = array();
+foreach (explode(',', $m[1]) as $fn) {
+    $fn = trim($fn);
+    if ($fn === '') {
+        continue;
+    }
+    if (isset($keep[$fn])) {
+        $removed[] = $fn;
+        continue;
+    }
+    $out[$fn] = true;
+}
+if (!$removed) {
+    exit(0);
+}
+$line = 'disable_functions = ' . implode(',', array_keys($out));
+$src = preg_replace('/^\s*disable_functions\s*=.*$/m', $line, $src, 1);
+file_put_contents($ini, $src);
+fwrite(STDERR, "Enabled in {$ini} for kb.php: " . implode(',', $removed) . "\n");
+PHP
+    done
+}
+kb_php_keep_kb_php_functions
+#####################
+
+# lua-md5 from apt is under 5.1/5.2. Search 5.1-5.4 so require "md5" finds it
+# (same paths as the working killbot-group.com.lua).
+if ! sudo apt install -y lua5.1; then
+    sudo apt install -y lua5.4 || sudo apt install -y lua5.3 || sudo apt install -y lua5.2
+fi
+sudo apt install -y lua-md5 luarocks
+sudo a2enmod lua
+
+KB_LUA_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
+KB_LUA_PATH=""
+KB_LUA_CPATH=""
+for ver in 5.1 5.2 5.3 5.4; do
+    KB_LUA_PATH+="/usr/share/lua/${ver}/?.lua;/usr/share/lua/${ver}/?/init.lua;/usr/local/share/lua/${ver}/?.lua;"
+    KB_LUA_CPATH+="/usr/lib/${KB_LUA_MULTIARCH}/lua/${ver}/?.so;/usr/lib/${KB_LUA_MULTIARCH}/lua/${ver}/?/core.so;/usr/local/lib/lua/${ver}/?.so;"
+done
+
+rm -rf /var/log/apache2/*
+rm -rf /var/log/killbot/*
+
+
+kb_apache_restart
+
+echo "Apache + PHP is installed."
+
+sudo apt install dnsutils
+
+sudo apt install -y certbot python3-certbot-apache
+
+echo "Certbot for SSL has been installed."
+
+sudo apt install -y curl
+sudo apt install jq -y
+
+sudo mkdir -p /opt/killbot
+sudo mkdir -p /opt/killbot/php
+sudo mkdir -p /opt/killbot/lua
+sudo mkdir -p /opt/killbot/sh
+sudo mkdir -p /opt/killbot/f2b
+sudo mkdir -p /opt/killbot/certs
+sudo mkdir -p /opt/killbot/ssl
+sudo mkdir -p /opt/killbot/settings
+sudo mkdir -p /var/log/killbot
+sudo mkdir -p /var/log/killbot/ssh
+sudo mkdir -p /var/log/killbot/lua
+sudo mkdir -p /opt/killbot/html
+sudo chown -R www-data:www-data /var/log/killbot /var/log/killbot/lua /opt/killbot/lua /opt/killbot/php /opt/killbot/sh /opt/killbot/html
+sudo chown -R www-data:www-data /opt/killbot/settings/
+sudo chown www-data:www-data /opt/killbot/ssl
+sudo chmod 775 /opt/killbot/ssl
+
+echo "  permissions OK: /opt/killbot/ssl (www-data:www-data 775)"
+
+# /opt/killbot/killbot_revers is written after settings.php so
+# $rewrite_killbot_revers_on_install can be read first.
+
+# Create the countries config only if the file is missing
+if [ ! -f /opt/killbot/f2b/block_all_countries_except.config ]; then  
+  cat > /opt/killbot/f2b/block_all_countries_except.config <<'EOC'
+# Config file for block_all_countries_except.sh
+# Set a country code (for example RU, US, DE, FR, etc.)
+# You can list several countries separated by commas: COUNTRY="RU,BY,GE"
+COUNTRIES="RU,BY"
+PORTS="443,80,22"
+EOC
+fi
+
+sudo touch /opt/killbot/tokens
+
+# Check if file exists, if not create it with the IP address
+if [ ! -f "/opt/killbot/wl-ip" ]; then    
+    # Default white-list ips
+    echo -e "37.140.192.59" > /opt/killbot/wl-ip  # Overwrite existing file
+fi
+
+if [ ! -f "/opt/killbot/wl-path" ]; then    
+    # Default wl-path
+    echo -e "/favicon.ico" > /opt/killbot/wl-path  # Overwrite existing file
+fi
+
+if [ ! -f "/opt/killbot/wl-ua" ]; then    
+    # Default white-list user agents
+    echo -e "yandex.bot\ngoogle.bot\nbaidu.bot\nWhatsApp.W\nbing.bot\nfacebook.bot\nvk.bot\ninstagram.bot\ntwitter.bot\nlinkedin.bot\npinterest.bot\nviber.bot\nslack.bot\nskype.bot\ntelegram.bot\nwhatsapp.bot\nletsencrypt" > /opt/killbot/wl-ua
+fi
+
+FILE="/opt/killbot/html/verification.php"
+kb_download "$FILE" "html/verification.html"
+if [ $? -eq 0 ]; then
+    echo "The verification page has been successfully loaded."
+else
+    echo "Error loading the verification page."
+    exit 1
+fi
+
+FILE="/opt/killbot/html/verification_options.php"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/verification_options.php"
+    if [ $? -eq 0 ]; then
+        echo "The verification options have been successfully loaded."
+    else
+        echo "Error loading the verification options."
+        exit 1
+    fi
+else
+    echo "Keep existing settings: $FILE"
+fi
+
+FILE="/opt/killbot/html/verification_options_example.php"
+kb_download "$FILE" "html/verification_options_example.php"
+if [ $? -eq 0 ]; then
+    echo "The verification options example has been successfully loaded."
+else
+    echo "Error loading the verification options example."
+    exit 1
+fi
+
+# Never replace an existing settings.php — only create it once, then
+# append missing keys so manually set values stay as they are.
+if [ ! -f /opt/killbot/settings.php ]; then
+cat > /opt/killbot/settings.php <<'EOF'
+<?php
+// Local KillBot server settings.
+// Created once at /opt/killbot/settings.php and not overwritten on update.
+// Edit this file as root. www-data can read it but cannot change it.
+
+// Accept fullchain + privkey from the centralized LE server (le_receive_cert.php).
+// Set to false to refuse every POST, never write keys, and never delete local certbot certs.
+$kb_accept_centralized_certs = true;
+
+// Allow kb.php to change this server (install/reconfigure a site, enable/disable
+// protection, delete a cert, write allowlists). Set to false so kb.php only
+// answers version (type=v) and diagnostics (type=health_check / check_host).
+// install.sh itself does not read this flag — lock the web API, not the CLI.
+$kb_allow_install_sh = true;
+
+// IPs allowed to POST certificates to le_receive_cert.php
+$kb_le_allowed_server_ips = ['45.66.116.213'];
+
+$kb_le_ssl_base_dir = '/opt/killbot/ssl';
+$kb_le_letsencrypt_dir = '/etc/letsencrypt';
+
+// After a successful centralized receive, delete the local certbot certificate for that domain.
+// Ignored when $kb_accept_centralized_certs is false.
+$kb_le_remove_local_letsencrypt = true;
+
+// Inline /js/cn.js into verification.html when the file exists on this server.
+// false = browser fetches cn.js over HTTP as before.
+$kb_inline_cn_js = false;
+
+// Rewrite /opt/killbot/killbot_revers (shared backend list) on kb_install.sh.
+// true = replace with the installer default list. false = keep the current file.
+$rewrite_killbot_revers_on_install = true;
+EOF
+    echo "Created /opt/killbot/settings.php"
+else
+    echo "Keep existing settings: /opt/killbot/settings.php"
+fi
+if [ -f /opt/killbot/settings.php ] && ! grep -q 'kb_inline_cn_js' /opt/killbot/settings.php; then
+cat >> /opt/killbot/settings.php <<'EOF'
+
+// Inline /js/cn.js into verification.html when the file exists on this server.
+// false = browser fetches cn.js over HTTP as before.
+$kb_inline_cn_js = false;
+EOF
+    echo "Added kb_inline_cn_js to /opt/killbot/settings.php"
+fi
+if [ -f /opt/killbot/settings.php ] && ! grep -q 'rewrite_killbot_revers_on_install' /opt/killbot/settings.php; then
+cat >> /opt/killbot/settings.php <<'EOF'
+
+// Rewrite /opt/killbot/killbot_revers (shared backend list) on kb_install.sh.
+// true = replace with the installer default list. false = keep the current file.
+$rewrite_killbot_revers_on_install = true;
+EOF
+    echo "Added rewrite_killbot_revers_on_install to /opt/killbot/settings.php"
+fi
+chown root:root /opt/killbot/settings.php
+chmod 644 /opt/killbot/settings.php
+
+# Shared Killbot backends. Default: overwrite on every kb_install.sh.
+# Set $rewrite_killbot_revers_on_install = false in settings.php to keep
+# a hand-edited list. A missing file is always created.
+kb_write_killbot_revers=1
+if [ -f /opt/killbot/settings.php ]; then
+    kb_flag="$(php -d display_errors=0 -r 'include "/opt/killbot/settings.php"; if (!isset($rewrite_killbot_revers_on_install)) { echo "1"; } else { echo empty($rewrite_killbot_revers_on_install) ? "0" : "1"; }' 2>/dev/null || echo 1)"
+    kb_flag="${kb_flag//$'\r'/}"
+    kb_flag="${kb_flag##*$'\n'}"
+    if [ "$kb_flag" = "0" ]; then
+        kb_write_killbot_revers=0
+    fi
+fi
+if [ "$kb_write_killbot_revers" = "0" ] && [ -s /opt/killbot/killbot_revers ]; then
+    echo "Keeping existing /opt/killbot/killbot_revers (rewrite_killbot_revers_on_install = false)"
+else
+    cat > /opt/killbot/killbot_revers <<'EOC'
+10052024.ru
+r1.kill-bot.ru
+data.killbot.ru
+r3.nl.kill-bot.ru
+r4.us.kill-bot.ru
+r6.sg.kill-bot.net
+EOC
+    chmod 644 /opt/killbot/killbot_revers
+    echo "Wrote /opt/killbot/killbot_revers with default Killbot backends"
+fi
+
+FILE="/var/www/html/empty.php"
+    kb_download "$FILE" "html/empty_nginx.html"
+    
+    if [ $? -eq 0 ]; then
+        echo "The empty php page has been successfully loaded."
+    else
+        echo "Error loading the empty php page."
+        exit 1
+    fi
+
+FILE="/var/www/html/empty_ru.html"
+    kb_download "$FILE" "html/empty_ru.html"
+    
+    if [ $? -eq 0 ]; then
+        echo "The empty RU page has been successfully loaded."
+    else
+        echo "Error loading the empty RU page."
+        exit 1
+    fi
+
+FILE="/var/www/html/empty_en.html"
+    kb_download "$FILE" "html/empty_en.html"
+    
+    if [ $? -eq 0 ]; then
+        echo "The empty EN page has been successfully loaded."
+    else
+        echo "Error loading the empty EN page."
+        exit 1
+    fi
+
+FILE="/opt/killbot/UpdateAll.sh"
+    kb_download "$FILE" "sh/UpdateAll_nginx.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The UpdateAll.sh file has been successfully loaded."
+    else
+        echo "Error loading the UpdateAll.sh file."
+        exit 1
+    fi
+
+FILE="/opt/killbot/official_allowed_ips.sh"
+    kb_download "$FILE" "sh/official_allowed_ips.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The official_allowed_ips.sh file has been successfully loaded."
+    else
+        echo "Error loading the official_allowed_ips.sh file."
+        exit 1
+    fi
+
+FILE="/opt/killbot/html/FakeBot.php"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/FakeBot.html"
+
+    if [ $? -eq 0 ]; then
+        echo "FakeBot page loaded."
+    else
+        echo "Error loading the FakeBot page."
+        exit 1
+    fi
+fi
+
+
+FILE="/opt/killbot/html/BlockBot.html"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/BlockBot.html"
+
+    if [ $? -eq 0 ]; then
+        echo "BlockBot page loaded."
+    else
+        echo "Error loading the BlockBot page."
+        exit 1
+    fi
+fi
+
+FILE="/opt/killbot/html/Expired.html"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/Expired.html"
+
+    if [ $? -eq 0 ]; then
+        echo "Expired page loaded."
+    else
+        echo "Error loading the Expired page."
+        exit 1
+    fi
+fi
+
+
+FILE="/opt/killbot/f2b/subnet-monitor.sh"
+    kb_download "$FILE" "sh/subnet-monitor.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "subnet-monitor loaded."
+    else
+        echo "Error loading the subnet-monitor."
+        exit 1
+    fi
+
+FILE="/opt/killbot/f2b/unblock_traffic.sh"
+    kb_download "$FILE" "sh/unblock_traffic.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "unblock_traffic loaded."
+    else
+        echo "Error loading the unblock_traffic.sh"
+        exit 1
+    fi
+
+
+FILE="/opt/killbot/f2b/check_apache_and_block.sh"
+    kb_download "$FILE" "sh/check_apache_and_block.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "check_apache_and_block.sh loaded."
+    else
+        echo "Error loading the check_apache_and_block."
+        exit 1
+    fi
+
+FILE="/opt/killbot/f2b/block_all_countries_except.sh"
+    kb_download "$FILE" "sh/block_all_countries_except.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "block_all_countries_except.sh loaded."
+    else
+        echo "Error loading the block_all_countries_except."
+        exit 1
+    fi
+
+FILE="/opt/killbot/cert_delete.sh"
+    kb_download "$FILE" "sh/cert_delete.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "cert_delete loaded."
+    else
+        echo "Error loading the cert_delete."
+        exit 1
+    fi
+
+FILE="/opt/killbot/html/access_denied.html"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/access_denied.html"
+
+    if [ $? -eq 0 ]; then
+        echo "access_denied loaded."
+    else
+        echo "Error loading the access_denied.html"
+        exit 1
+    fi
+fi
+
+FILE="/opt/killbot/html/too_many_requests.html"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/too_many_requests.html"
+
+    if [ $? -eq 0 ]; then
+        echo "too_many_requests loaded."
+    else
+        echo "Error loading the too_many_requests.html"
+        exit 1
+    fi
+fi
+
+FILE="/var/www/html/le_receive_cert.php"
+    kb_download "$FILE" "html/le_custom_server/le_receive_cert.html"
+
+    if [ $? -eq 0 ]; then
+        echo "le_receive_cert.php loaded."
+    else
+        echo "Error loading le_receive_cert.html"
+        exit 1
+    fi
+
+sudo chown www-data:www-data /var/www/html/le_receive_cert.php
+sudo chmod 644 /var/www/html/le_receive_cert.php
+
+FILE="/opt/killbot/check_killbot_reverse_proxy.sh"
+    kb_download "$FILE" "sh/check_killbot_reverse_proxy.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The check_killbot_reverse_proxy.sh file has been successfully loaded."
+    else
+        echo "Error loading the check_killbot_reverse_proxy.sh file."
+        exit 1
+    fi
+
+FILE="/opt/killbot/setup_killbot_reverse_proxy.sh"
+    kb_download "$FILE" "sh/setup_killbot_reverse_proxy.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The setup_killbot_reverse_proxy.sh file has been successfully loaded."
+    else
+        echo "Error loading the setup_killbot_reverse_proxy.sh file."
+        exit 1
+    fi
+
+FILE="/opt/killbot/update-postrouting.sh"
+    kb_download "$FILE" "sh/update-postrouting.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The update-postrouting.sh has been successfully loaded."
+    else
+        echo "Error loading the update-postrouting.sh."
+        exit 1
+    fi
+
+FILE="/opt/killbot/update-symmetric-ip.sh"
+    kb_download "$FILE" "sh/update-symmetric-ip.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The update-symmetric-ip.sh has been successfully loaded."
+    else
+        echo "Error loading the update-symmetric-ip.sh."
+        exit 1
+    fi
+
+FILE="/opt/killbot/check_host_curl.sh"
+    kb_download "$FILE" "sh/check_host_curl.sh"
+    
+    if [ $? -eq 0 ]; then
+        echo "The check_host_curl.sh has been successfully loaded."
+    else
+        echo "Error loading the check_host_curl.sh."
+        exit 1
+    fi
+
+FILE="/opt/killbot/read_apache_log.sh"
+    kb_download "$FILE" "sh/read_apache_log.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "The read_apache_log.sh has been successfully loaded."
+    else
+        echo "Error loading the read_apache_log.sh."
+        exit 1
+    fi
+    
+
+FILE="/opt/killbot/dns_provider_hint.sh"
+    kb_download "$FILE" "sh/dns_provider_hint.sh"
+    if [ $? -eq 0 ]; then
+        echo "The dns_provider_hint.sh file has been successfully loaded."
+    else
+        echo "Error loading the dns_provider_hint.sh file."
+        exit 1
+    fi
+
+FILE="/opt/killbot/backup_send.sh"
+    kb_download "$FILE" "sh/backup_send.sh"
+    if [ $? -eq 0 ]; then
+        echo "The backup_send.sh has been successfully loaded."
+    else
+        echo "Error loading the backup_send.sh."
+        exit 1
+    fi
+
+FILE="/opt/killbot/backup_restore.sh"
+    kb_download "$FILE" "sh/backup_restore.sh"
+    if [ $? -eq 0 ]; then
+        echo "The backup_restore.sh has been successfully loaded."
+    else
+        echo "Error loading the backup_restore.sh."
+        exit 1
+    fi
+
+echo "Setting permissions on KillBot scripts..."
+for f in \
+    /opt/killbot/check_killbot_reverse_proxy.sh \
+    /opt/killbot/setup_killbot_reverse_proxy.sh \
+    /opt/killbot/update-postrouting.sh \
+    /opt/killbot/update-symmetric-ip.sh \
+    /opt/killbot/check_host_curl.sh \
+    /opt/killbot/read_apache_log.sh \
+    /opt/killbot/backup_send.sh \
+    /opt/killbot/backup_restore.sh \
+    /opt/killbot/f2b/subnet-monitor.sh \
+    /opt/killbot/UpdateAll.sh \
+    /opt/killbot/official_allowed_ips.sh \
+    /opt/killbot/cert_delete.sh \
+    /opt/killbot/f2b/block_all_countries_except.sh \
+    /opt/killbot/f2b/check_apache_and_block.sh \
+    /opt/killbot/f2b/unblock_traffic.sh
+do
+    if [ -e "$f" ]; then
+        sudo chmod +x "$f" || true
+    fi
+done
+if [ -e /opt/killbot/check_host_curl.sh ]; then
+    sudo chown root:root /opt/killbot/check_host_curl.sh || true
+    sudo chmod 755 /opt/killbot/check_host_curl.sh || true
+fi
+if [ -e /opt/killbot/read_apache_log.sh ]; then
+    sudo chown root:root /opt/killbot/read_apache_log.sh || true
+    sudo chmod 755 /opt/killbot/read_apache_log.sh || true
+fi
+if [ -e /opt/killbot/dns_provider_hint.sh ]; then
+    sudo chmod 644 /opt/killbot/dns_provider_hint.sh || true
+fi
+for f in \
+    /opt/killbot/html/FakeBot.php \
+    /opt/killbot/html/BlockBot.html \
+    /opt/killbot/html/Expired.html \
+    /opt/killbot/html/verification.php \
+    /opt/killbot/html/verification_options.php \
+    /opt/killbot/html/verification_options_example.php
+do
+    if [ -e "$f" ]; then
+        sudo chown www-data:www-data "$f" || true
+    fi
+done
+rm -f /opt/killbot/acme_check_api.sh /opt/killbot/renew_wildcard.sh /opt/killbot/update.sh /etc/cron.d/killbot-wildcard-renewal
+echo "Writing kb.lua and site templates..."
+
+cat > /opt/killbot/kbEqual.php <<'KB_EQUAL_EOF'
+#!/usr/bin/php
+<?php
+
+$stdin = fopen("php://stdin", "r");
+$logFile = '/var/log/killbot/kbEqual.log';
+
+while (($line = fgets($stdin)) !== false) {
+    $line = trim($line);
+    if (empty($line)) {
+        continue;
+    }
+    list($value1, $value2) = explode('.', $line);
+    echo (strcmp($value1, $value2) === 0) ? "true\n" : "false\n";
+    fflush(STDOUT);
+}
+
+fclose($stdin);
+KB_EQUAL_EOF
+chmod +x /opt/killbot/kbEqual.php
+
+# Package paths need shell expansion. Quote the rest so $(...) in comments
+# is not executed as command substitution.
+cat > /opt/killbot/kb.lua <<EOF
+package.path = "${KB_LUA_PATH}" .. package.path
+package.cpath = "${KB_LUA_CPATH}" .. package.cpath
+EOF
+cat >> /opt/killbot/kb.lua <<'KB_LUA_BODY'
+
+local md5 = require "md5"
+
+local cache = cache or {}
+local lastFlush = 0
+local lifetime = 86400
+local LOG_ENABLED = false
+local DNS_SERVER = "8.8.8.8"
+-- "77.88.8.8"
+
+function log_message(message,domain)
+    if not LOG_ENABLED then return false end
+
+    local f = io.open("/var/log/killbot/lua/" .. domain .. ".log", "a")
+    if f then
+        f:write(message .. "\n")
+        f:close()
+    end
+end
+
+-- POSIX shell quoting. Lua %q is not shell-safe (command substitution still runs inside double quotes).
+local function sh_quote(s)
+    s = tostring(s or "")
+    return "'" .. string.gsub(s, "'", "'\\''") .. "'"
+end
+
+local function run_php_cli(script, xff, ip, ua, host)
+    local cmd = "KB_CLI_XFF=" .. sh_quote(xff) ..
+        " KB_CLI_IP=" .. sh_quote(ip) ..
+        " KB_CLI_UA=" .. sh_quote(ua) ..
+        " KB_CLI_HOST=" .. sh_quote(host) ..
+        " php " .. sh_quote(script)
+    local handle = io.popen(cmd)
+    if not handle then
+        return ""
+    end
+    local result = handle:read("*a")
+    handle:close()
+    return result or ""
+end
+
+kb_lua_agents
+
+kb_lua_paths
+
+kb_lua_ips
+
+local disallowed_paths = {}
+
+local function load_disallowed_paths(file_path)
+    local paths = {}
+    local f = io.open(file_path, "r")
+    if not f then
+        return paths
+    end
+
+    for line in f:lines() do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            table.insert(paths, line)
+        end
+    end
+
+    f:close()
+    return paths
+end
+
+disallowed_paths = load_disallowed_paths("/opt/killbot/settings/kb_domain/disallowed_paths.txt")
+
+local function load_dns_bots_allowed(file_path)
+    local engines = {}
+    local f = io.open(file_path, "r")
+
+    if not f then
+        log_message("dns bots file open failed: " .. tostring(file_path), "trafficgen.net")
+        return engines
+    end
+
+    for line in f:lines() do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+
+        if line ~= "" and line:sub(1,1) ~= "#" then
+            local bot_pattern, domains = line:match("([^|]+)|(.+)")
+
+            if bot_pattern and domains then
+                local hostname_patterns = {}
+
+                for domain in domains:gmatch("([^,]+)") do
+                    domain = domain:gsub("^%s+", ""):gsub("%s+$", "")
+                    table.insert(hostname_patterns, domain)
+                end
+
+                table.insert(engines, {
+                    bot_pattern = bot_pattern,
+                    hostname_patterns = hostname_patterns
+                })
+            end
+        end
+    end
+
+    f:close()
+    return engines
+end
+
+local function path_disallowed(path)
+    for _, pattern in ipairs(disallowed_paths) do
+        if pattern:sub(-1) == "$" then
+            local exact = pattern:sub(1, -2)
+            if path == exact then
+                return true
+            end
+        else
+            if path:sub(1, #pattern) == pattern then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function agent_allowed(agent)
+    
+    if not agent then return false end
+
+    agent = agent:lower()
+
+    for _, pattern in ipairs(allowed_agents) do
+        local all_found = true                
+        for word in pattern:gmatch("[^%.]+") do
+            if word ~= "" and not agent:find(word:lower(), 1, true) then                
+                all_found = false
+                break
+            end
+        end
+
+        if all_found then
+            return true
+        end
+    end
+
+    return false
+end
+
+function check_dns_works()
+    local cmd = "dig +short @" .. DNS_SERVER .. " google.com 2>/dev/null | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' | head -1"
+    local handle = io.popen(cmd)
+    local result = handle:read("*l")
+    handle:close()
+    
+    return (result and result ~= "")
+end
+
+-- Helper to resolve a hostname to IP via the given DNS server
+function get_hostname_ips(hostname)
+    local ips = {}
+
+    if not hostname or hostname == "" or hostname:find("[^%w%.%-]") then
+        return ips
+    end
+
+    local cmd = "dig +short @" .. DNS_SERVER .. " " .. sh_quote(hostname) .. " 2>/dev/null | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'"
+    local handle = io.popen(cmd)
+    if handle then
+        local result = handle:read("*a")
+        handle:close()
+
+        for ip in string.gmatch(result, "%d+%.%d+%.%d+%.%d+") do
+            table.insert(ips, ip)
+        end
+    end
+
+    if #ips == 0 then
+        local cmd = "nslookup " .. sh_quote(hostname) .. " " .. DNS_SERVER .. " 2>/dev/null | grep 'Address: ' | grep -v '#'"
+        local handle = io.popen(cmd)
+        if handle then
+            local result = handle:read("*a")
+            handle:close()
+
+            for ip in string.gmatch(result, "%d+%.%d+%.%d+%.%d+") do
+                table.insert(ips, ip)
+            end
+        end
+    end
+
+    return ips
+end
+
+function check_hostname(hostname, user_agent, client_ip)
+
+    if not client_ip or client_ip == "" then
+        return "bot_false"
+    end
+
+    local bots = load_dns_bots_allowed("/opt/killbot/settings/kb_domain/dns_bots_allowed.txt")
+
+    local ua = string.lower(user_agent or "")
+    local bot_ua_found = false
+
+    for _, data in pairs(bots) do
+        if string.find(ua, string.lower(data.bot_pattern), 1, true) then
+            bot_ua_found = true
+
+            if not hostname or hostname == "" then
+                break
+            end
+
+            local hostname_ok = false
+            for _, pattern in ipairs(data.hostname_patterns) do
+                if #pattern <= #hostname and hostname:sub(-#pattern):lower() == pattern:lower() then
+                    hostname_ok = true
+                    break
+                end
+            end
+
+            if not hostname_ok then
+                return "bot_false"
+            end
+
+            local dns_ips = get_hostname_ips(hostname)
+            for _, ip in ipairs(dns_ips) do
+                if ip == client_ip then
+                    return "bot_true"
+                end
+            end
+
+            return "bot_false"
+        end
+    end
+
+    if bot_ua_found then
+        return "bot_false"
+    end
+
+    return "user"
+end
+
+function modifyMd5(input)
+    return md5.sumhexa(input)
+end
+
+
+local function ip_allowed(ip)
+    for _, pattern in ipairs(allowed_ips) do
+        if pattern:sub(-1) == "." then
+            if ip:sub(1, #pattern) == pattern then
+                return true
+            end
+        elseif ip == pattern then
+            return true
+        end
+    end
+    return false
+end
+
+local function path_allowed(path)
+    for _, pattern in ipairs(allowed_paths) do
+        if pattern:sub(-1) == "$" then
+            local exact = pattern:sub(1, -2)
+            if path == exact then
+                return true
+            end
+        else
+            if path:sub(1, #pattern) == pattern then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local allowed_ips_cache = nil
+
+local function ipv4_to_number(ip)
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+
+    if not a or not b or not c or not d then
+        return nil
+    end
+
+    if a < 0 or a > 255 or b < 0 or b > 255 or c < 0 or c > 255 or d < 0 or d > 255 then
+        return nil
+    end
+
+    return a * 16777216 + b * 65536 + c * 256 + d
+end
+
+local function ip_in_cidr(ip, cidr)
+    local network, prefix = cidr:match("^([%d%.]+)/(%d+)$")
+    prefix = tonumber(prefix)
+
+    if not network or not prefix or prefix < 0 or prefix > 32 then
+        return false
+    end
+
+    local ip_num = ipv4_to_number(ip)
+    local net_num = ipv4_to_number(network)
+
+    if not ip_num or not net_num then
+        return false
+    end
+
+    if prefix == 0 then
+        return true
+    end
+
+    local block_size = 2 ^ (32 - prefix)
+    return math.floor(ip_num / block_size) == math.floor(net_num / block_size)
+end
+
+local function load_allowed_prefixes(filename)
+    local prefixes = {}
+    local file = io.open(filename, "r")
+    if not file then
+        return prefixes
+    end
+
+    for line in file:lines() do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" and not line:match("^#") then
+            prefixes[#prefixes + 1] = line
+        end
+    end
+
+    file:close()
+    return prefixes
+end
+
+local function is_ip_in_allowed_url(ip, host)
+    if not ip or ip == "" then
+        return false
+    end
+
+    local allowed_file = "/opt/killbot/settings/kb_domain/official_allowed_ips_genetated.txt"
+
+    if not allowed_ips_cache then
+        allowed_ips_cache = load_allowed_prefixes(allowed_file)
+    end
+
+    for i = 1, #allowed_ips_cache do
+        if ip_in_cidr(ip, allowed_ips_cache[i]) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function handle(r)
+    local user_agent = r.headers_in["User-Agent"] or ""
+    local remote_addr = r.subprocess_env["REAL_REMOTE_ADDR"] or ""
+    local kb_session = r.subprocess_env["KBSESSION"] or ""
+    local http_host = r.headers_in["Host"] or ""
+    local http_host2 = ""
+
+-- deny not exist 1.3 protokol: ddos case
+    if r.protocol == "HTTP/1.3" then        
+     -- return apache2.DONE
+        return apache2.FORBIDDEN --FORCE LUA ERROR TO PREVENT CPU
+    end
+
+    local remote_addr_org = remote_addr
+    local current_path = r.uri or "/"
+
+    if path_disallowed(current_path) then
+        local cmd = 'cat /opt/killbot/html/access_denied.html'
+        local handle = io.popen(cmd)
+        local result = handle:read("*a")
+        handle:close()
+
+        r.status = 403
+        r.content_type = "text/html; charset=UTF-8"
+        r:puts(result)
+
+        log_message("ip:" .. remote_addr_org .. " disallowed path: " .. current_path .. " access denied page showed DONE", http_host)
+
+        return apache2.DONE
+    end
+
+    if is_ip_in_allowed_url(remote_addr, http_host) then
+        return apache2.DECLINED
+    end
+
+--[[
+--  deny request with any get params: if ddos
+    if r.args and #r.args > 0 then
+        log_message("ip:" .. (r.subprocess_env["REAL_REMOTE_ADDR"] or "") .. " GET parameters detected: " .. r.args .. " - 403 FORBIDDEN", r.headers_in["Host"] or "")
+        -- return apache2.DONE
+        return apache2.FORBIDDEN --FORCE LUA ERROR TO PREVENT CPU
+    end
+]]
+
+--[[
+--  deny request with 1 get param and get param len = 4 and get param val = 4 and param val is not int: if ddos
+if r.args and #r.args > 0 then
+    local params = {}
+    for k, v in string.gmatch(r.args, "([^=&]+)=([^&]*)") do
+        params[k] = v
+    end
+
+    local count = 0
+    for _ in pairs(params) do count = count + 1 end
+
+    if count == 1 then
+        for key, val in pairs(params) do
+            local key_len = #key
+            local val_len = #val
+
+            local val_is_number = string.match(val, "^%d+$") ~= nil
+
+            if key_len == 4 and val_len == 4 and not val_is_number then
+                -- log_message("ip:" .. (r.subprocess_env["REAL_REMOTE_ADDR"] or "") .. " Suspicious 4=4 GET param detected: " .. key .. "=" .. val .. " - 403 FORBIDDEN", r.headers_in["Host"] or "" )
+                -- return apache2.DONE
+                return apache2.FORBIDDEN --FORCE LUA ERROR TO PREVENT CPU
+
+            end
+        end
+    end
+end
+]]
+
+    -- Extract second-level domain for http_host2
+    if http_host ~= "" then
+        local host = http_host:gsub(":%d+$", "")
+    
+        local parts = {}
+        for label in host:gmatch("([^.]+)") do
+            parts[#parts+1] = label
+        end
+
+        if #parts >= 2 then
+            http_host2 = parts[#parts-1] .. "." .. parts[#parts]
+        else            
+            http_host2 = host
+        end
+    end
+        
+    local x_forwarded_for = r.headers_in["X-Forwarded-For"] or ""
+    local path = r.uri or ""
+
+    if r.uri == "/verification.php" then
+        return apache2.DECLINED
+    end
+
+    if r.uri == "/FakeBot.php" then
+        return apache2.DECLINED
+    end
+
+    if r.uri == "/access_denied.html" then
+        return apache2.DECLINED
+    end
+
+    if r.uri == "/too_many_requests.html" then
+        return apache2.DECLINED
+    end
+
+    if ip_allowed(remote_addr_org) then
+        log_message("ip:"  .. remote_addr_org .. " ip_allowed: " .. remote_addr_org .. " DECLINED",http_host)
+        return apache2.DECLINED
+    end
+
+    if path_allowed(r.unparsed_uri) then
+        log_message("ip:"  .. remote_addr_org .. " path_allowed: " .. r.unparsed_uri .. " DECLINED",http_host)
+        return apache2.DECLINED
+    end
+
+    local hostname = ""
+    if remote_addr_org:match("^%d+%.%d+%.%d+%.%d+$") then
+        local handle = io.popen("host " .. sh_quote(remote_addr_org))
+        if handle then
+            local result = handle:read("*a")
+            handle:close()
+            if result then
+                hostname = string.match(result, "domain name pointer ([^%s]+)%.") or ""
+            end
+        end
+    end
+
+    local is_real_bot = check_hostname(hostname, user_agent, remote_addr_org)
+    
+    if is_real_bot == "bot_false" then
+        local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+        r.content_type = "text/html"
+        r:puts(result)
+
+        log_message("ip:"  .. remote_addr_org .. " fake bot UA without matching rDNS: " .. user_agent .. " VP showed DONE",http_host)
+
+        return apache2.DONE
+    end
+
+    if agent_allowed(user_agent) then
+        log_message("ip:"  .. remote_addr_org .. " trusted user agent detected : " .. user_agent .. " DECLINED",http_host)
+        return apache2.DECLINED
+    end
+
+--    r.headers_out["X-Debug-User-Agent"]  = user_agent
+--    r.headers_out["X-Debug-Remote-Addr"] = remote_addr
+--    r.headers_out["X-Debug-KB-Session"]  = kb_session
+--    r.headers_out["X-Debug-Host"]        = http_host
+
+    if #kb_session >=1 then
+        local ct = tonumber(string.sub(kb_session, 1, -5))
+        local now = math.floor(os.time() * 1000)
+
+        if  ct == nil or math.abs(now - ct) > (lifetime * 1000) then
+--          r.filename = "/opt/killbot/html/verification.php"
+--          r.content_type = "text/html"
+--          r:sendfile(r.filename)
+
+            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+            r.content_type = "text/html"
+            r:puts(result)
+
+            log_message("ip:"  .. remote_addr_org .. " kbSession is expired : " .. kb_session .. " VP showed DONE",http_host)
+
+            return apache2.DONE
+
+        end
+    end
+
+    local ipParts = {}
+    for part in remote_addr:gmatch("([^.]+)") do
+        table.insert(ipParts, part)
+    end
+    table.remove(ipParts)
+    remote_addr = table.concat(ipParts, ".")
+
+--    r.headers_out["X-Debug-Remote-Addr-2"] = remote_addr
+
+    -- Same fields Apache puts in the request env: User-Agent, REAL_REMOTE_ADDR, KBSESSION, Host.
+    local line = table.concat({user_agent, remote_addr, kb_session, http_host}, "")
+
+    local expected_hash = r.subprocess_env["KBCHECK"] or "123"
+    local computed_hash = ""
+    if cache[line] ~= nil then
+        computed_hash = cache[line]
+    end
+
+    local now = os.time()
+    if now - lastFlush > 300 then
+        cache = {}
+        lastFlush = now
+    end
+
+    if computed_hash == expected_hash then
+        r.subprocess_env["KBCHECK_MUST_BE"] = "true"
+        log_message("ip:"  .. remote_addr_org .. " cached computed_hash == expected_hash: '" .. computed_hash .. "' DECLINED",http_host)
+        return apache2.DECLINED
+    end
+
+    computed_hash = modifyMd5(line)
+
+--    r.headers_out["X-Debug-expected_hash"] = expected_hash
+--    r.headers_out["X-Debug-computed_hash"] = computed_hash
+--    r.headers_out["X-Debug-computed_line"] = line
+--    r.headers_out["X-Debug-Res"] = "NEXT"
+
+    if computed_hash == expected_hash then
+        r.subprocess_env["KBCHECK_MUST_BE"] = "true"
+        log_message("ip:"  .. remote_addr_org .. " computed computed_hash == expected_hash: " .. computed_hash .. " DECLINED",http_host)
+        return apache2.DECLINED
+    else
+--        if line2 then computed_hash = modifyMd5(line2) end
+
+        if computed_hash == expected_hash then
+            r.subprocess_env["KBCHECK_MUST_BE"] = "true"
+            log_message("ip:"  .. remote_addr_org .. " computed computed_hash == expected_hash: " .. computed_hash .. " DECLINED",http_host)
+            return apache2.DECLINED
+        else    
+            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+            r.content_type = "text/html"
+            r:puts(result)
+
+            log_message("ip:"  .. remote_addr_org .. " VP showed DONE line=" .. line,http_host)
+
+            return apache2.DONE
+        end
+    end
+end
+
+KB_LUA_BODY
+
+cat > /opt/killbot/nginx_custom.conf <<'EOF'
+# Per-site KillBot proxy options.
+# Copy to /opt/killbot/settings/{domain}/nginx_custom.conf and uncomment
+# lines to override defaults for that site. install.sh does not overwrite
+# the per-site file. Unknown or invalid lines are ignored.
+#
+# Defaults when the per-site file is missing (current KillBot behavior):
+#   Header unset X-Frame-Options
+#   SSLProxyCheckPeerCN Off
+#   SSLProxyCheckPeerName Off
+#   SSLProxyCheckPeerExpire Off
+#   proxy_ssl_verify off
+#   ModSecurity CRS is not included
+
+# IncludeOptional /usr/share/modsecurity-crs/*.load
+
+# Header unset X-Frame-Options
+# Header unset X-Frame-Options Off
+
+# SSLProxyCheckPeerCN Off
+# SSLProxyCheckPeerName Off
+# SSLProxyCheckPeerExpire Off
+
+# proxy_ssl_verify off;
+EOF
+chmod 644 /opt/killbot/nginx_custom.conf
+
+cat > /opt/killbot/load_nginx_custom_conf.sh <<'EOF'
+#!/bin/bash
+# Load /opt/killbot/settings/{domain}/nginx_custom.conf without source/eval.
+
+kb_norm_onoff() {
+    local v="${1:-}"
+    v="${v%;}"
+    v="${v,,}"
+    case "$v" in
+        on) echo On ;;
+        off) echo Off ;;
+        *) echo "" ;;
+    esac
+}
+
+kb_norm_onoff_ngx() {
+    local v="${1:-}"
+    v="${v%;}"
+    v="${v,,}"
+    case "$v" in
+        on) echo on ;;
+        off) echo off ;;
+        *) echo "" ;;
+    esac
+}
+
+load_nginx_custom_conf() {
+    local domain="${1:-}"
+    KB_Header_unset_X_Frame_Options=1
+    KB_SSLProxyCheckPeerCN=Off
+    KB_SSLProxyCheckPeerName=Off
+    KB_SSLProxyCheckPeerExpire=Off
+    KB_proxy_ssl_verify=off
+    KB_IncludeOptional_modsecurity_crs=0
+
+    local conf="/opt/killbot/settings/${domain}/nginx_custom.conf"
+    if [[ -z "$domain" || ! -f "$conf" || ! -r "$conf" ]]; then
+        return 0
+    fi
+
+    local line trimmed key val n
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        [[ -z "$trimmed" ]] && continue
+        [[ "$trimmed" =~ ^# ]] && continue
+
+        if [[ "$trimmed" == "IncludeOptional /usr/share/modsecurity-crs/*.load" || "$trimmed" == "IncludeOptional /usr/share/modsecurity-crs/*.load;" ]]; then
+            KB_IncludeOptional_modsecurity_crs=1
+            continue
+        fi
+
+        if [[ "$trimmed" =~ ^Header[[:space:]]+unset[[:space:]]+X-Frame-Options(.*)$ ]]; then
+            val="${BASH_REMATCH[1]}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="${val%;}"
+            if [[ -z "$val" ]]; then
+                KB_Header_unset_X_Frame_Options=1
+                continue
+            fi
+            n="$(kb_norm_onoff "$val")"
+            if [[ "$n" == "On" ]]; then
+                KB_Header_unset_X_Frame_Options=1
+            elif [[ "$n" == "Off" ]]; then
+                KB_Header_unset_X_Frame_Options=0
+            else
+                echo "nginx_custom.conf: ignored invalid Header unset X-Frame-Options value: $val" >&2
+            fi
+            continue
+        fi
+
+        if [[ "$trimmed" =~ ^SSLProxyCheckPeerCN[[:space:]]+([^[:space:]]+)\;?$ ]]; then
+            n="$(kb_norm_onoff "${BASH_REMATCH[1]}")"
+            if [[ -n "$n" ]]; then
+                KB_SSLProxyCheckPeerCN="$n"
+            else
+                echo "nginx_custom.conf: ignored invalid SSLProxyCheckPeerCN value: ${BASH_REMATCH[1]}" >&2
+            fi
+            continue
+        fi
+
+        if [[ "$trimmed" =~ ^SSLProxyCheckPeerName[[:space:]]+([^[:space:]]+)\;?$ ]]; then
+            n="$(kb_norm_onoff "${BASH_REMATCH[1]}")"
+            if [[ -n "$n" ]]; then
+                KB_SSLProxyCheckPeerName="$n"
+            else
+                echo "nginx_custom.conf: ignored invalid SSLProxyCheckPeerName value: ${BASH_REMATCH[1]}" >&2
+            fi
+            continue
+        fi
+
+        if [[ "$trimmed" =~ ^SSLProxyCheckPeerExpire[[:space:]]+([^[:space:]]+)\;?$ ]]; then
+            n="$(kb_norm_onoff "${BASH_REMATCH[1]}")"
+            if [[ -n "$n" ]]; then
+                KB_SSLProxyCheckPeerExpire="$n"
+            else
+                echo "nginx_custom.conf: ignored invalid SSLProxyCheckPeerExpire value: ${BASH_REMATCH[1]}" >&2
+            fi
+            continue
+        fi
+
+        if [[ "$trimmed" =~ ^proxy_ssl_verify[[:space:]]+([^[:space:]]+)\;?$ ]]; then
+            n="$(kb_norm_onoff_ngx "${BASH_REMATCH[1]}")"
+            if [[ -n "$n" ]]; then
+                KB_proxy_ssl_verify="$n"
+            else
+                echo "nginx_custom.conf: ignored invalid proxy_ssl_verify value: ${BASH_REMATCH[1]}" >&2
+            fi
+            continue
+        fi
+
+        echo "nginx_custom.conf: ignored unknown line: $trimmed" >&2
+    done < "$conf"
+}
+EOF
+chmod 644 /opt/killbot/load_nginx_custom_conf.sh
+
+cat > /opt/killbot/apache443-killbot.sh <<EOF
+#!/bin/bash
+
+if [ \$# -ne 8 ]; then
+  echo "Usage: \$0 <domain> <main_domain> <secondary_domain> <backend_ip> <user_agent_disallowed> <wlpath> <ip_disallowed> <cdn_static> <cdn_domain> <cdn_paths> <https>"
+  #exit 1
+fi
+
+domain=\$1
+main_domain=\$2
+secondary_domain=\$3
+backend_ip=\$4
+
+user_agent_disallowed="\$5"
+wlpath="\$6"
+ip_disallowed="\$7"
+
+cdn_static=\$8
+cdn_domain=\$9
+cdn_paths=\${10}
+https=\${11}
+cdn_paths_array=()
+cdn_domain_no_https=""
+
+if [[ -n "\$cdn_paths" ]]; then
+    IFS=',' read -ra cdn_paths_array <<< "\$cdn_paths"
+fi
+
+if [[ "\$cdn_static" == "2" ]] && [[ -n "\$cdn_domain" ]]; then
+    cdn_domain_no_https=\$(echo "\$cdn_domain" | sed -E 's#^https?://##; s#/.*##')
+fi
+
+KB_Header_unset_X_Frame_Options=1
+KB_SSLProxyCheckPeerCN=Off
+KB_SSLProxyCheckPeerName=Off
+KB_SSLProxyCheckPeerExpire=Off
+KB_proxy_ssl_verify=off
+KB_IncludeOptional_modsecurity_crs=0
+if [[ -f /opt/killbot/load_nginx_custom_conf.sh ]]; then
+    # shellcheck disable=SC1091
+    . /opt/killbot/load_nginx_custom_conf.sh
+    load_nginx_custom_conf "\$domain"
+fi
+
+KB_SOLVER_SNIPPET=""
+if [ -f /etc/nginx/snippets/killbot.conf ]; then
+    KB_SOLVER_SNIPPET="    include /etc/nginx/snippets/killbot.conf;"
+fi
+
+nginXConfigFile="/etc/nginx/sites-available/\$domain.conf"
+
+nginXconfigContent="server {
+    listen 80;
+    server_name \$domain www.\$domain *.\$domain;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\\\$host\\\$request_uri;
+}
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name \$domain www.\$domain *.\$domain;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+\$KB_SOLVER_SNIPPET
+
+    ssl_certificate ***SSLCertificateFile***;
+    ssl_certificate_key ***SSLCertificateKeyFile***;
+
+    if (\\\$server_protocol = 'HTTP/1.3') {
+        return 403;
+    }
+
+    if (\\\$request_uri ~ '^([^?]*?)/{2,}(\?.*)?\\\$') {
+        return 301 \\\$scheme://\\\$host\\\$1/\\\$is_args\\\$args;
+    }
+
+    #if (\\\$args ~ .+) { return 444; }  # block if there is at least one query parameter (useful during DDoS)
+    
+    #if (\\\$args ~ (^|&)(param1|param2|param3)(=|&|\\\$)) { return 444; } # block if a query parameter is one of param1,param2,param3... (useful during DDoS)
+
+    location ^~ /.well-known {
+
+    if (\\\$kb_should_block) { return 444; }
+
+        root /var/www/html;
+        default_type text/plain;
+        try_files \\\$uri =404;
+        
+        # Logging (optional)
+        access_log /var/log/nginx/well-known.log;
+        
+        # Allow everyone
+        allow all;
+    }
+
+    location / {
+
+        if (\\\$kb_should_block) { return 444; }
+
+        #    DDoS JS-cookie gate: a browser will pass, a simple bot without JS will not. Replace kb_ddos_pass with your own cookie name
+        #    if (\\\$http_cookie !~* \"(^|;\s*)kb_ddos_pass=1($|;)\") {
+        #        add_header Content-Type text/html;
+        #        return 200 '<!doctype html><html><head><meta charset=\"utf-8\"><script>document.cookie=\"kb_ddos_pass=1; Max-Age=86400; Path=/; SameSite=Lax\"; location.reload();</script></head><body></body></html>';
+        #    }
+
+";
+
+nginXconfigContent+="
+        proxy_ssl_server_name on;
+        proxy_ssl_name \\\$host;
+        proxy_ssl_verify \${KB_proxy_ssl_verify:-off};
+";
+
+if [  -n "\$cdn_domain" ] && [ \${#cdn_paths_array[@]} -gt 0 ]; then
+
+nginXconfigContent+="
+proxy_set_header Accept-Encoding '';
+
+sub_filter_once off;
+sub_filter_types text/html;
+"
+
+for path in "\${cdn_paths_array[@]}"; do
+
+nginXconfigContent+="
+
+sub_filter 'href=\"\${path}'  'href=\"\$cdn_domain\${path}';
+sub_filter 'href=\"\${path:1}'  'href=\"\$cdn_domain\${path}';
+sub_filter 'href=\"https://\\\$host\${path}'  'href=\"\$cdn_domain\${path}';
+sub_filter 'href=\"http://\\\$host\${path}'  'href=\"\$cdn_domain\${path}';
+sub_filter 'href=\"//\\\$host\${path}'  'href=\"\$cdn_domain\${path}';
+
+sub_filter \"href='\${path}\"  \"href='\$cdn_domain\${path}\";
+sub_filter \"href='\${path:1}\"  \"href='\$cdn_domain\${path}\";
+sub_filter \"href='https://\\\$host\${path}\"  \"href='\$cdn_domain\${path}\";
+sub_filter \"href='http://\\\$host\${path}\"  \"href='\$cdn_domain\${path}\";
+sub_filter \"href='//\\\$host\${path}\"  \"href='\$cdn_domain\${path}\";
+
+sub_filter 'src=\"\${path}'  'src=\"\$cdn_domain\${path}';
+sub_filter 'src=\"\${path:1}'  'src=\"\$cdn_domain\${path}';
+sub_filter 'src=\"https://\\\$host\${path}'  'src=\"\$cdn_domain\${path}';
+sub_filter 'src=\"http://\\\$host\${path}'  'src=\"\$cdn_domain\${path}';
+sub_filter 'src=\"//\\\$host\${path}'  'src=\"\$cdn_domain\${path}';
+
+sub_filter \"src='\${path}\"  \"src='\$cdn_domain\${path}\";
+sub_filter \"src='\${path:1}\"  \"src='\$cdn_domain\${path}\";
+sub_filter \"src='https://\\\$host\${path}\"  \"src='\$cdn_domain\${path}\";
+sub_filter \"src='http://\\\$host\${path}\"  \"src='\$cdn_domain\${path}\";
+sub_filter \"src='//\\\$host\${path}\"  \"src='\$cdn_domain\${path}\";
+"
+
+done
+
+fi
+
+nginXconfigContent+="proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass https://127.0.0.1:8443;
+        proxy_set_header Host \\\$host;
+        #proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        #proxy_set_header X-Forwarded-Proto \\\$scheme;
+        #proxy_set_header X-Forwarded-Host \\\$host;
+        #proxy_set_header X-Forwarded-Port \\\$server_port;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3h;
+        proxy_read_timeout 3h;
+
+    }
+
+}"
+
+#create or rewrite
+echo -e "\$nginXconfigContent" | sudo tee "\$nginXConfigFile" > /dev/null
+
+configFile="/etc/apache2/sites-available/\$domain-killbot.conf"
+
+
+configContent="<VirtualHost 127.0.0.1:8443>
+    ServerName \$secondary_domain
+    ***www_ssl_on***
+    SSLCertificateFile ***SSLCertificateFile***
+    SSLCertificateKeyFile ***SSLCertificateKeyFile***
+
+    Redirect permanent / https://\$main_domain/
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8080>
+    ServerName \$main_domain
+    ServerAlias \$secondary_domain    
+    ServerAlias www.\$domain
+    ***SubdomainAlias***
+   
+    RewriteEngine On        
+    RewriteCond %{HTTP_HOST} ^(\$main_domain|\$secondary_domain)\$ [NC]
+    RewriteRule ^(.*)\$ https://\$main_domain%{REQUEST_URI} [R=301,L]
+        
+    RewriteCond %{HTTP_HOST} ^(.+)\.\$domain\$ [NC]
+    RewriteRule ^(.*)\$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8443>
+    ServerName \$main_domain
+    ServerAlias www.\$domain
+    ***SubdomainAlias***
+
+    RewriteEngine on
+
+    SSLEngine on
+    SSLCertificateFile ***SSLCertificateFile***
+    SSLCertificateKeyFile ***SSLCertificateKeyFile***
+    
+    AllowEncodedSlashes NoDecode
+
+    ErrorLog /var/log/apache2/\$domain.error.log
+    CustomLog /var/log/apache2/\$domain.access.log combined_kb
+
+    # verification.php restrictions
+    <Files \"/opt/killbot/html/verification.php\">
+        Header set Connection \"close\"        
+    </Files>
+
+    Alias /FakeBot.php /opt/killbot/html/FakeBot.php
+    <Directory /opt/killbot/html>
+        <Files \"FakeBot.php\">
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
+    Alias /access_denied.html /opt/killbot/html/access_denied.html
+    <Directory /opt/killbot/html>
+        <Files 'access_denied.html'>
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
+    Alias /too_many_requests.html /opt/killbot/html/too_many_requests.html
+    <Directory /opt/killbot/html>
+        <Files 'too_many_requests.html'>
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+   
+    <Directory '/var/www/html/.well-known'>
+        Options None
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+#    RewriteCond %{REQUEST_URI} ^/verification\.php [NC]
+#    RewriteCond %{REQUEST_METHOD} POST
+#    RewriteRule ^(.*)$ /$1 [R=302,L]
+
+    SetEnvIf X-Forwarded-For \"^([0-9\.]+)\" REAL_REMOTE_ADDR=\\\$1
+
+    RewriteCond %{ENV:REAL_REMOTE_ADDR} ^$
+    RewriteRule .* - [E=REAL_REMOTE_ADDR:%{REMOTE_ADDR}]
+
+    RewriteCond %{HTTP_COOKIE} (^|;\s*)kbCheck=([^;]+) [NC]
+    RewriteRule ^ - [E=KBCHECK:%2]
+
+    RewriteCond %{HTTP_COOKIE} (^|;\s*)kbSession=([^;]+) [NC]
+    RewriteRule ^ - [E=KBSESSION:%2]
+
+    RewriteCond %{ENV:KBCHECK} ^Expired\$
+    RewriteRule ^(.*)\$ /opt/killbot/html/Expired.html [L]
+
+    RewriteRule ^ - [E=KBCHECK_MUST_BE:true]
+    LuaHookFixups /opt/killbot/lua/\$domain.lua handle
+"
+    
+if [[ "\$https" == "https" ]]; then 
+    configContent+="
+            SSLProxyEngine On 
+            SSLProxyCheckPeerCN \$KB_SSLProxyCheckPeerCN
+            SSLProxyCheckPeerName \$KB_SSLProxyCheckPeerName
+            SSLProxyCheckPeerExpire \$KB_SSLProxyCheckPeerExpire
+    "
+fi
+
+configContent+="
+        ProxyPass /FakeBot.php !
+        ProxyPass /opt/killbot/html/FakeBot.php !
+
+        ProxyPass /access_denied.html !
+        ProxyPass /opt/killbot/html/access_denied.html !
+
+        ProxyPass /too_many_requests.html !
+        ProxyPass /opt/killbot/html/too_many_requests.html !
+
+        ProxyPass /.well-known !
+        ProxyPass /var/www/html/.well-known !
+        
+        # set X-Real-IP if not exist
+        RequestHeader setIfEmpty X-Real-IP \"%{REAL_REMOTE_ADDR}e\"
+
+        # Set X-Forwarded-For
+        #RewriteRule .* - [E=SERVER_REMOTE_ADDR:%{REMOTE_ADDR}]
+        #RequestHeader append X-Forwarded-For \"%{SERVER_REMOTE_ADDR}e\"
+
+"
+if [[ "\$KB_Header_unset_X_Frame_Options" == "1" ]]; then
+    configContent+="
+        Header unset X-Frame-Options
+"
+fi
+if [[ "\$KB_IncludeOptional_modsecurity_crs" == "1" ]]; then
+    configContent+="
+        IncludeOptional /usr/share/modsecurity-crs/*.load
+"
+fi
+configContent+="
+        #RequestHeader set Host \"\$main_domain\"
+"        
+
+if [[ -n "\$cdn_domain_no_https" ]]; then
+    # Check CDN domain availability
+    cdn_check_url="\$https://\${cdn_domain_no_https}/"
+    http_code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -H "Host: \$main_domain" "\$cdn_check_url")
+    if [ "\$http_code" -ne 200 ]; then
+    configContent+="
+            #ProxyPreserveHost On
+            ProxyPreserveHost Off
+"        
+    else        
+        configContent+="
+            ProxyPreserveHost On            
+            #ProxyPreserveHost Off
+"                    
+    fi
+        
+else
+    configContent+="
+        ProxyPreserveHost On        
+        #ProxyPreserveHost Off
+"
+fi
+
+if [[ -n "\$cdn_domain_no_https" ]]; then
+
+    configContent+="        
+            ProxyPass /robots.txt \$https://\$backend_ip/robots.txt
+            ProxyPassReverse /robots.txt \$https://\$backend_ip/robots.txt
+
+            ProxyPass / \$https://\$cdn_domain_no_https/
+            ProxyPassReverse / \$https://\$cdn_domain_no_https/
+    "
+else
+    configContent+="        
+            ProxyPass / \$https://\$backend_ip/ nocanon
+            ProxyPassReverse / \$https://\$backend_ip/
+    "
+fi
+
+configContent+="        
+    <Directory /opt/killbot/html>
+        Options Indexes FollowSymLinks MultiViews
+        AllowOverride All
+        Require all granted
+
+        Order allow,deny
+        Allow from all
+
+        Header set Cache-Control \"no-cache, no-store, must-revalidate\"
+        Header set Pragma \"no-cache\"
+        Header set Expires 0
+    </Directory>
+
+</VirtualHost>"
+
+echo -e "\$configContent" | sudo tee "\$configFile" > /dev/null
+
+echo "Configuration for \$domain has been created."
+EOF
+
+chmod +x /opt/killbot/apache443-killbot.sh
+
+
+cat > /opt/killbot/apache80_letsencrypt_test.sh <<EOF
+#!/bin/bash
+
+if [ \$# -ne 2 ]; then
+  echo "Usage: \$0 <domain> <backend_ip>"
+  exit 1
+fi
+
+domain=\$1
+backend_ip=\$2
+
+nginXConfigFile="/etc/nginx/sites-available/\$domain.conf"
+
+KB_Header_unset_X_Frame_Options=1
+KB_SSLProxyCheckPeerCN=Off
+KB_SSLProxyCheckPeerName=Off
+KB_SSLProxyCheckPeerExpire=Off
+KB_proxy_ssl_verify=off
+KB_IncludeOptional_modsecurity_crs=0
+if [[ -f /opt/killbot/load_nginx_custom_conf.sh ]]; then
+    # shellcheck disable=SC1091
+    . /opt/killbot/load_nginx_custom_conf.sh
+    load_nginx_custom_conf "\$domain"
+fi
+: "\${KB_proxy_ssl_verify:=off}"
+
+KB_SOLVER_SNIPPET=""
+if [ -f /etc/nginx/snippets/killbot.conf ]; then
+    KB_SOLVER_SNIPPET="    include /etc/nginx/snippets/killbot.conf;"
+fi
+
+nginXconfigContent="
+server {    
+    listen 80;
+    listen 443 ssl;
+    http2 on;
+    server_name \$domain www.\$domain *.\$domain;
+
+    include /etc/nginx/conf.d/killbot-too-many-requests.inc;
+    include /etc/nginx/snippets/sql-injection.conf;
+    include /etc/nginx/snippets/block-hidden-files.conf;
+\$KB_SOLVER_SNIPPET
+
+    if (\\\$server_protocol = 'HTTP/1.3') {
+        return 403;
+    }
+
+    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+
+    if (\\\$request_uri ~ '^([^?]*?)/{2,}(\?.*)?\\\$') {
+        return 301 \\\$scheme://\\\$host\\\$1/\\\$is_args\\\$args;
+    }
+
+    location ^~ /.well-known {
+
+        if (\\\$kb_should_block) { return 444; }
+
+        root /var/www/html;
+        default_type text/plain;
+        try_files \\\$uri =404;
+        
+        # Logging (optional)
+        access_log /var/log/nginx/well-known.log;
+        
+        # Allow everyone
+        allow all;
+    }
+
+    location / {
+
+        if (\\\$kb_should_block) { return 444; }
+
+        proxy_ssl_server_name on;
+        proxy_ssl_name \\\$host;
+        proxy_ssl_verify \${KB_proxy_ssl_verify:-off};
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+
+        proxy_pass https://127.0.0.1:8443;
+        proxy_set_header Host \\\$host;
+        #proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        #proxy_set_header X-Forwarded-Proto \\\$scheme;
+        #proxy_set_header X-Forwarded-Host \\\$host;
+        #proxy_set_header X-Forwarded-Port \\\$server_port;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3h;
+        proxy_read_timeout 3h;
+
+        include /etc/nginx/conf-proxy-custom/*.conf;
+        include /etc/nginx/conf-proxy--site/\$domain.*.conf;
+    } 
+
+    include /etc/nginx/conf-custom/*.conf;
+    include /etc/nginx/conf-custom-site/\$domain.*.conf;
+   
+}"
+
+#create or rewrite
+echo -e "\$nginXconfigContent" | sudo tee "\$nginXConfigFile" > /dev/null
+
+configFile="/etc/apache2/sites-available/\$domain-le.conf"
+
+configContent="<VirtualHost 127.0.0.1:8080>
+   
+    ServerName \$domain
+    ServerAlias www.\$domain
+    DocumentRoot /var/www/html
+
+    Alias /.well-known /var/www/html/.well-known
+    <Directory "/var/www/html/.well-known">
+        Options None
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    RewriteEngine On
+
+    RewriteCond %{REQUEST_URI} !^/kb.php$
+    RewriteCond %{REQUEST_URI} !^/le_receive_cert.php$
+    RewriteCond %{REQUEST_URI} !^/empty.php$
+    RewriteCond %{REQUEST_URI} !^/le_custom_server/request.php$
+    RewriteCond %{REQUEST_URI} !^/\.well-known
+    RewriteRule ^ /empty.php [L]
+
+    ErrorLog /var/log/apache2/\$domain-le.error.log
+    CustomLog /var/log/apache2/\$domain-le.access.log combined
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8443>
+    ServerName \$domain
+    ServerAlias www.\$domain
+    DocumentRoot /var/www/html
+   
+    Alias /.well-known /var/www/html/.well-known
+    <Directory "/var/www/html/.well-known">
+        Options None
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    RewriteEngine On
+
+    RewriteCond %{REQUEST_URI} !^/kb.php$
+    RewriteCond %{REQUEST_URI} !^/le_receive_cert.php$
+    RewriteCond %{REQUEST_URI} !^/empty.php$
+    RewriteCond %{REQUEST_URI} !^/le_custom_server/request.php$
+    RewriteCond %{REQUEST_URI} !^/\.well-known
+    RewriteRule ^ /empty.php [L]
+
+    
+    # SSL Configuration with self-signed certificate
+    SSLEngine on
+    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile   /etc/ssl/private/ssl-cert-snakeoil.key
+
+    ErrorLog /var/log/apache2/\$domain-le-ssl.error.log
+    CustomLog /var/log/apache2/\$domain-le-ssl.access.log combined
+</VirtualHost>
+"
+
+if [ ! -f "\$configFile" ]; then
+    #Create file if not exist
+    echo -e "\$configContent" | sudo tee "\$configFile" > /dev/null
+fi
+
+echo "Configuration for \$domain-le has been created."
+EOF
+chmod +x /opt/killbot/apache80_letsencrypt_test.sh
+
+
+
+cat > /opt/killbot/apache443.sh <<EOF
+#!/bin/bash
+
+if [ \$# -ne 5 ]; then
+  echo "Usage: \$0 <domain> <main_domain> <secondary_domain> <backend_ip> <folder>"
+  exit 1
+fi
+
+domain=\$1
+main_domain=\$2
+secondary_domain=\$3
+backend_ip=\$4
+https=\$5
+
+KB_Header_unset_X_Frame_Options=1
+KB_SSLProxyCheckPeerCN=Off
+KB_SSLProxyCheckPeerName=Off
+KB_SSLProxyCheckPeerExpire=Off
+KB_proxy_ssl_verify=off
+KB_IncludeOptional_modsecurity_crs=0
+if [[ -f /opt/killbot/load_nginx_custom_conf.sh ]]; then
+    # shellcheck disable=SC1091
+    . /opt/killbot/load_nginx_custom_conf.sh
+    load_nginx_custom_conf "\$domain"
+fi
+
+configFile="/etc/apache2/sites-available/\$domain.conf"
+
+configContent="<VirtualHost 127.0.0.1:8443>
+    ServerName \$secondary_domain
+
+    ***www_ssl_on***
+    SSLCertificateFile ***SSLCertificateFile***
+    SSLCertificateKeyFile ***SSLCertificateKeyFile***
+
+    Redirect permanent / https://\$main_domain/
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8080>
+    ServerName \$main_domain
+    ServerAlias \$secondary_domain    
+    ServerAlias www.\$domain
+    ***SubdomainAlias***
+   
+    RewriteEngine On        
+    RewriteCond %{HTTP_HOST} ^(\$main_domain|\$secondary_domain)\$ [NC]
+    RewriteRule ^(.*)\$ https://\$main_domain%{REQUEST_URI} [R=301,L]
+        
+    RewriteCond %{HTTP_HOST} ^(.+)\.\$domain\$ [NC]
+    RewriteRule ^(.*)\$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+</VirtualHost>
+
+<VirtualHost 127.0.0.1:8443>
+    ServerName \$main_domain
+    ServerAlias \$secondary_domain
+    ServerAlias www.\$domain
+    ***SubdomainAlias***
+
+    ErrorLog \\\${APACHE_LOG_DIR}/error.log
+    CustomLog \\\${APACHE_LOG_DIR}/access.log combined
+
+    SSLEngine on
+    SSLCertificateFile ***SSLCertificateFile***
+    SSLCertificateKeyFile ***SSLCertificateKeyFile***
+
+    AllowEncodedSlashes NoDecode
+
+    RewriteEngine on
+
+    SetEnvIf X-Forwarded-For \"^([0-9\.]+)\" REAL_REMOTE_ADDR=$1
+
+    RewriteCond %{ENV:REAL_REMOTE_ADDR} ^$
+    RewriteRule .* - [E=REAL_REMOTE_ADDR:%{REMOTE_ADDR}]
+
+    Alias /access_denied.html /opt/killbot/html/access_denied.html
+    <Directory /opt/killbot/html>
+        <Files "access_denied.html">
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
+    Alias /too_many_requests.html /opt/killbot/html/too_many_requests.html
+    <Directory /opt/killbot/html>
+        <Files "too_many_requests.html">
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
+    Alias /.well-known /var/www/html/.well-known
+    <Directory "/var/www/html/.well-known">
+        Options None
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    #Define PROXY_ENABLE
+
+    <IfDefine PROXY_ENABLE>
+        ProxyPreserveHost On
+"
+if [[ "\$https" == "https" ]]; then 
+        configContent+="
+        SSLProxyEngine On 
+        SSLProxyCheckPeerCN \$KB_SSLProxyCheckPeerCN
+        SSLProxyCheckPeerName \$KB_SSLProxyCheckPeerName
+        SSLProxyCheckPeerExpire \$KB_SSLProxyCheckPeerExpire
+"
+fi
+
+configContent+="
+        ProxyPass /.well-known !
+        ProxyPass /var/www/html/.well-known !
+
+        ProxyPass /access_denied.html !
+        ProxyPass /opt/killbot/html/access_denied.html !
+
+        ProxyPass /too_many_requests.html !
+        ProxyPass /opt/killbot/html/too_many_requests.html !
+       
+        # set X-Real-IP if not exist
+        RequestHeader setIfEmpty X-Real-IP "%{REAL_REMOTE_ADDR}e"
+
+        # Set X-Forwarded-For
+        #RewriteRule .* - [E=SERVER_REMOTE_ADDR:%{REMOTE_ADDR}]
+        #RequestHeader append X-Forwarded-For "%{SERVER_REMOTE_ADDR}e"
+
+"
+if [[ "\$KB_Header_unset_X_Frame_Options" == "1" ]]; then
+        configContent+="
+        Header unset X-Frame-Options
+"
+fi
+if [[ "\$KB_IncludeOptional_modsecurity_crs" == "1" ]]; then
+        configContent+="
+        IncludeOptional /usr/share/modsecurity-crs/*.load
+"
+fi
+configContent+="
+        #RequestHeader set Host "\$main_domain"
+
+        ProxyPass / \$https://\$backend_ip/ nocanon
+        ProxyPassReverse / \$https://\$backend_ip/
+
+
+    </IfDefine>
+    
+</VirtualHost>"
+
+
+#create or rewrite
+echo -e "\$configContent" | sudo tee "\$configFile" > /dev/null
+
+echo "Configuration for \$domain has been created."
+EOF
+
+chmod +x /opt/killbot/apache443.sh
+
+cat > /etc/init.d/kb <<EOF
+#!/bin/bash
+#
+# Script for managing killbot
+#
+
+# Path to Apache configurations directory
+APACHE_CONF_DIR="/etc/apache2/sites-available"
+# Path to killbot installation script
+KILLBOT_INSTALL_SCRIPT="/opt/killbot/install.sh"
+# Path to killbot cert delete script
+KILLBOT_CERT_DELETE_SCRIPT="/opt/killbot/cert_delete.sh"
+# Path to killbot settings
+SETTINGS_DIR="/opt/killbot/settings"
+KB_ENC_MOUNT_SCRIPT="/opt/killbot/install/kb_enc_mount_to_html_ram.sh"
+KB_HEALTH_CHECK_SCRIPT="/opt/killbot/server_health_check.sh"
+KB_HEALTH_STATUS_FILE="/var/www/html/data.killbot.ru/index.html"
+# Prefix for nginx reverse-proxy configs (loaded before *.domain)
+REVERSE_PROXY_NGINX_PREFIX="000-"
+
+# Check for root privileges
+if [ "\$(id -u)" != "0" ]; then
+   echo "This script must be run as root." 1>&2
+   exit 1
+fi
+set -f
+
+# Domain charset only: letters, digits, hyphen, dot.
+kb_valid_token() {
+    local a="\$1"
+    [ -z "\$a" ] && return 0
+    [ "\${#a}" -gt 253 ] && return 1
+    case "\$a" in
+        *.conf|*.lua|*.sh|*.load) return 1 ;;
+    esac
+    [[ "\$a" =~ ^[A-Za-z0-9.-]+\$ ]]
+}
+
+# Hostname only (letters required). Rejects paths, IPs, and globs.
+kb_valid_domain() {
+    local d="\$1"
+    local label
+    kb_valid_token "\$d" || return 1
+    if [ -z "\$d" ] || [ "\${#d}" -gt 253 ]; then
+        return 1
+    fi
+    case "\$d" in
+        *..*|.*|*.|*-.*|*.conf|*.lua) return 1 ;;
+    esac
+    if [[ ! "\$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\$ ]]; then
+        return 1
+    fi
+    if [[ ! "\$d" =~ [A-Za-z] ]]; then
+        return 1
+    fi
+    local IFS='.'
+    for label in \$d; do
+        [ -z "\$label" ] && return 1
+        [ "\${#label}" -gt 63 ] && return 1
+        case "\$label" in
+            -*|*-) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+kb_require_domain() {
+    if ! kb_valid_domain "\$1"; then
+        echo "Invalid domain." 1>&2
+        exit 1
+    fi
+}
+
+# One domain only. "kb remove *" must not wipe every vhost after the
+# caller shell expands * to a list of config files.
+kb_require_one_domain() {
+    if [ "\$#" -ne 2 ]; then
+        echo "Usage: \$0 \$1 domain" 1>&2
+        echo "Exactly one domain is required. Wildcards are not allowed." 1>&2
+        exit 1
+    fi
+    kb_require_domain "\$2"
+}
+
+kb_require_no_args() {
+    if [ "\$#" -ne 1 ]; then
+        echo "Usage: \$0 \$1" 1>&2
+        exit 1
+    fi
+}
+
+kb_require_ensite_opt() {
+    [ -z "\$1" ] && return 0
+    if [ "\$1" != "p" ]; then
+        echo "Invalid ensite option." 1>&2
+        exit 1
+    fi
+}
+
+# Function to check Apache and Nginx configuration
+check_apache_config() {
+    # Checking Apache configuration for errors
+    apache2ctl configtest > /dev/null 2>&1
+    if [ \$? -ne 0 ]; then
+        echo "Apache configuration test failed."
+        apache2ctl configtest
+        exit 1
+    fi
+    
+    # Checking Nginx configuration for errors
+    nginx -t > /dev/null 2>&1
+    if [ \$? -ne 0 ]; then
+        echo "Nginx configuration test failed."
+        nginx -t
+        exit 1
+    fi
+}
+
+# Function to delete killbot certificate
+cert_del() {
+    local domain=\$1
+
+    if [ -z "\$domain" ]; then
+        echo "Usage: \$0 cert_del domain"
+        exit 1
+    fi
+
+    if [ ! -x "\$KILLBOT_CERT_DELETE_SCRIPT" ]; then
+        echo "Cert delete script not found or not executable: \$KILLBOT_CERT_DELETE_SCRIPT"
+        exit 1
+    fi
+
+    "\$KILLBOT_CERT_DELETE_SCRIPT" "\$domain"
+    echo "Certificate deleted for domain \$domain."
+}
+
+# Path to killbot_revers for domain (settings/DOMAIN or legacy /opt/killbot/DOMAIN/)
+get_killbot_revers_file() {
+    local domain=\$1
+
+    if [ -f "\${SETTINGS_DIR}/\${domain}/killbot_revers" ]; then
+        echo "\${SETTINGS_DIR}/\${domain}/killbot_revers"
+    elif [ -f "/opt/killbot/\${domain}/killbot_revers" ]; then
+        echo "/opt/killbot/\${domain}/killbot_revers"
+    fi
+}
+
+reverse_proxy_nginx_conf_name() {
+    local proxy="\$1"
+    echo "\${REVERSE_PROXY_NGINX_PREFIX}\${proxy}.conf"
+}
+
+# Disable nginx reverse-proxy vhosts listed in killbot_revers (no-op if file missing)
+disable_reverse_proxy_nginx() {
+    local domain=\$1
+    local revers_file proxy line conf
+
+    revers_file=\$(get_killbot_revers_file "\$domain")
+    [ -z "\$revers_file" ] && return 0
+
+    while IFS= read -r line || [ -n "\$line" ]; do
+        line="\${line%%#*}"
+        line="\$(echo "\$line" | tr -d '[:space:]')"
+        [ -z "\$line" ] && continue
+
+        if [[ "\$line" == *:* ]]; then
+            proxy="\${line%%:*}"
+        else
+            proxy="\$line"
+        fi
+
+        proxy="\${proxy#https://}"
+        proxy="\${proxy#http://}"
+        proxy="\${proxy%%/*}"
+        [ -z "\$proxy" ] && continue
+
+        conf="\$(reverse_proxy_nginx_conf_name "\$proxy")"
+        rm -f "/etc/nginx/sites-enabled/\${conf}"
+        rm -f "/etc/nginx/sites-enabled/\${proxy}.conf"
+    done < "\$revers_file"
+}
+
+# Enable nginx reverse-proxy vhosts listed in killbot_revers (no-op if file missing)
+enable_reverse_proxy_nginx() {
+    local domain=\$1
+    local revers_file proxy line conf avail
+
+    revers_file=\$(get_killbot_revers_file "\$domain")
+    [ -z "\$revers_file" ] && return 0
+
+    while IFS= read -r line || [ -n "\$line" ]; do
+        line="\${line%%#*}"
+        line="\$(echo "\$line" | tr -d '[:space:]')"
+        [ -z "\$line" ] && continue
+
+        if [[ "\$line" == *:* ]]; then
+            proxy="\${line%%:*}"
+        else
+            proxy="\$line"
+        fi
+
+        proxy="\${proxy#https://}"
+        proxy="\${proxy#http://}"
+        proxy="\${proxy%%/*}"
+        [ -z "\$proxy" ] && continue
+
+        conf="\$(reverse_proxy_nginx_conf_name "\$proxy")"
+        avail="/etc/nginx/sites-available/\${conf}"
+        [ -f "\$avail" ] || continue
+        rm -f "/etc/nginx/sites-enabled/\${proxy}.conf"
+        ln -sf "\$avail" "/etc/nginx/sites-enabled/\${conf}"
+    done < "\$revers_file"
+}
+
+# Remove nginx reverse-proxy configs (sites-available + sites-enabled)
+purge_reverse_proxy_nginx() {
+    local domain=\$1
+    local revers_file proxy line conf
+
+    revers_file=\$(get_killbot_revers_file "\$domain")
+    [ -z "\$revers_file" ] && return 0
+
+    while IFS= read -r line || [ -n "\$line" ]; do
+        line="\${line%%#*}"
+        line="\$(echo "\$line" | tr -d '[:space:]')"
+        [ -z "\$line" ] && continue
+
+        if [[ "\$line" == *:* ]]; then
+            proxy="\${line%%:*}"
+        else
+            proxy="\$line"
+        fi
+
+        proxy="\${proxy#https://}"
+        proxy="\${proxy#http://}"
+        proxy="\${proxy%%/*}"
+        [ -z "\$proxy" ] && continue
+
+        conf="\$(reverse_proxy_nginx_conf_name "\$proxy")"
+        rm -f "/etc/nginx/sites-enabled/\${conf}" "/etc/nginx/sites-available/\${conf}"
+        rm -f "/etc/nginx/sites-enabled/\${proxy}.conf" "/etc/nginx/sites-available/\${proxy}.conf"
+    done < "\$revers_file"
+}
+
+disable_domain_sites() {
+    local domain=\$1
+    local standard_conf="\$domain.conf"
+    local killbot_conf="\$domain-killbot.conf"
+
+    a2dissite "\$standard_conf" > /dev/null 2>&1
+    a2dissite "\$killbot_conf" > /dev/null 2>&1
+    rm -f "/etc/nginx/sites-enabled/\${domain}.conf"
+    rm -f "/etc/nginx/sites-enabled/\${domain}-killbot.conf"
+    disable_reverse_proxy_nginx "\$domain"
+}
+
+# Function to disable apache sites for domain and reload apache
+# kb a2dissite {domain.ru}
+a2dissite_domain() {
+    local domain=\$1
+    local standard_conf="\$domain.conf"
+    local killbot_conf="\$domain-killbot.conf"
+
+    # check syntax first
+    check_apache_config
+
+    disable_domain_sites "\$domain"
+
+    # Reload Apache
+    service apache2 reload
+    service nginx reload
+    echo "Apache and nginx disabled for domain \$domain (both \$standard_conf and \$killbot_conf). Apache reloaded."
+}
+
+# Function to enable killbot screen configuration
+ensite() {
+    local domain=\$1
+    local opt=\$2
+    local killbot_conf="\$domain-killbot.conf"
+    local standard_conf="\$domain.conf"    
+
+    if [ ! -f "\$APACHE_CONF_DIR/\$killbot_conf" ]; then
+        printf  "Configuration \$killbot_conf not found.\nInstall killbot configuration first.\nUsage:\n -reverce proxy case: kb install -d {domain} -e {email} -ip {domain_backend_ip}\n"
+        exit 1
+    fi
+
+    # Disable the standard configuration
+    a2dissite "\$standard_conf" > /dev/null 2>&1
+
+    # Enable the killbot verification page configuration
+    a2ensite "\$killbot_conf" > /dev/null 2>&1
+
+    rm -f "/etc/nginx/sites-enabled/\$standard_conf.conf"
+    ln -sf "/etc/nginx/sites-available/\$standard_conf" "/etc/nginx/sites-enabled/\$standard_conf"
+
+    enable_reverse_proxy_nginx "\$domain"
+
+    # Enable the killbot screen configuration
+    echo "Killbot verification page for domain \$domain has been enabled."
+    
+    check_apache_config
+
+    # Restart Apache to apply changes
+    service apache2 reload
+    service nginx reload
+    
+}
+
+# Function to disable killbot screen configuration
+dissite() {
+    local domain=\$1
+    local killbot_conf="\$domain-killbot.conf"
+    local standard_conf="\$domain.conf"
+    
+    if [ ! -f "\$APACHE_CONF_DIR/\$standard_conf" ]; then        
+        printf  "Configuration \$standard_conf not found.\nInstall killbot configuration first.\nUsage:\n -if website in /var/www/html/domain folder): kb install domain email\n -proxy case (IP - website backend ip): kb install domain email ip\n"
+        exit 1
+    fi
+
+    # Disable the killbot verification page configuration
+    a2dissite "\$killbot_conf" > /dev/null 2>&1    
+
+    # Enable the standard configuration
+    a2ensite "\$standard_conf" > /dev/null 2>&1
+    ln -sf /etc/nginx/sites-available/\$standard_conf /etc/nginx/sites-enabled/
+
+    disable_reverse_proxy_nginx "\$domain"
+
+    check_apache_config
+
+    # Restart Apache to apply changes
+    service apache2 reload
+    service nginx reload
+    echo "Killbot screen for domain \$domain has been disabled."
+}
+
+# Function to reload apache2
+reload() {
+    
+    check_apache_config
+
+    # Restart Apache to apply changes
+    service apache2 reload
+    service nginx reload
+    echo "Apache2 reloaded. Nginx reload."
+}
+
+# Function to install killbot screen configuration
+install() {    
+
+    if [ ! -x "\$KILLBOT_INSTALL_SCRIPT" ]; then
+        echo "Killbot installation script not found or not executable."
+        exit 1
+    fi
+
+    # Run the installation script
+    "\$KILLBOT_INSTALL_SCRIPT" "\$1" "\$2" "\$3" "\$4" "\$5" "\$6" "\$7" "\$8" "\$9" "\${10}" "\${11}" "\${12}" "\${13}" "\${14}" "\${15}" "\${16}" "\${17}" "\${18}" "\${19}" "\${20}" "\${21}" "\${22}" "\${23}" "\${24}" "\${25}" "\${26}" "\${27}" "\${28}" "\${29}" "\${30}"
+    #echo "Killbot configuration with verification page for domain \$domain has been installed."
+}
+
+# kb remove {domain.ru} — fully remove the domain
+remove_domain() {
+    local domain=\$1
+
+    if [ -z "\$domain" ]; then
+        echo "Usage: \$0 remove domain"
+        exit 1
+    fi
+
+    if [[ "\$domain" == *"/"* || "\$domain" == *".."* ]]; then
+        echo "Invalid domain: \$domain"
+        exit 1
+    fi
+
+    disable_domain_sites "\$domain"
+    purge_reverse_proxy_nginx "\$domain"
+
+    if [ -x "\$KILLBOT_CERT_DELETE_SCRIPT" ]; then
+        "\$KILLBOT_CERT_DELETE_SCRIPT" "\$domain" do_not_reload || true
+    else
+        if command -v certbot >/dev/null 2>&1; then
+            certbot delete --cert-name "\$domain" --non-interactive 2>/dev/null || true
+        fi
+        if [ -d "/opt/killbot/ssl/\${domain}" ]; then
+            rm -rf "/opt/killbot/ssl/\${domain}"
+            echo "Removed: /opt/killbot/ssl/\${domain}"
+        fi
+    fi
+
+    if [ -d "\${SETTINGS_DIR}/\${domain}" ]; then
+        rm -rf "\${SETTINGS_DIR}/\${domain}"
+        echo "Removed: \${SETTINGS_DIR}/\${domain}"
+    fi
+
+    if [ -f "/opt/killbot/lua/\${domain}.lua" ]; then
+        rm -f "/opt/killbot/lua/\${domain}.lua"
+        echo "Removed: /opt/killbot/lua/\${domain}.lua"
+    fi
+
+    if [ -d "/opt/killbot/ssl/\${domain}" ]; then
+        rm -rf "/opt/killbot/ssl/\${domain}"
+        echo "Removed: /opt/killbot/ssl/\${domain}"
+    fi
+
+    if apache2ctl configtest >/dev/null 2>&1; then
+        service apache2 reload
+    fi
+
+    if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+        service nginx reload
+    fi
+
+    echo "Domain \$domain removed."
+}
+
+check_internet() {
+    echo "Checking internet connectivity (ping 8.8.8.8)..."
+    if ! command -v ping >/dev/null 2>&1; then
+        echo "ERROR: ping is not installed; cannot verify internet access." >&2
+        exit 1
+    fi
+    if ! ping -c 3 -W 3 8.8.8.8 >/dev/null 2>&1; then
+        echo "ERROR: this server has no internet access (ping 8.8.8.8 failed)." >&2
+        echo "The IP may be blocked from outside, or outbound internet on this server is misconfigured." >&2
+        exit 1
+    fi
+    echo "Internet: OK"
+}
+
+html_needs_decrypt() {
+    if [ ! -f "\$KB_ENC_MOUNT_SCRIPT" ]; then
+        return 1
+    fi
+    if [ ! -d "/var/www/html" ]; then
+        return 0
+    fi
+    if [ -f "/var/www/enc/gocryptfs.conf" ]; then
+        if findmnt -rno TARGET /var/www/html >/dev/null 2>&1; then
+            return 1
+        fi
+        return 0
+    fi
+    return 1
+}
+
+check_html_decrypted() {
+    if html_needs_decrypt; then
+        echo "Error: /var/www/html is missing or encrypted."
+        echo "Decrypt and start KillBot with: kb start"
+        return 1
+    fi
+    return 0
+}
+
+ensure_html_decrypted() {
+    if html_needs_decrypt; then
+        echo "Decrypting /var/www/html (gocryptfs will ask for the passphrase)..."
+        if ! "\$KB_ENC_MOUNT_SCRIPT"; then
+            echo "Error: failed to decrypt /var/www/html."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+check_solver_health() {
+    if [ ! -f "\$KB_HEALTH_CHECK_SCRIPT" ]; then
+        return 0
+    fi
+    if [ ! -f "\$KB_HEALTH_STATUS_FILE" ]; then
+        echo "Error: solver health status missing (\$KB_HEALTH_STATUS_FILE)."
+        return 1
+    fi
+    local body
+    body=\$(tr -d '\\r\\n' < "\$KB_HEALTH_STATUS_FILE" 2>/dev/null || true)
+    if [ "\$body" = "ok1." ]; then
+        echo "Solver health (data.killbot.ru/index.html): ok1."
+        return 0
+    fi
+    echo "Error: solver health check failed:"
+    echo "\$body"
+    return 1
+}
+
+status() {
+    check_internet
+
+    local failed=0
+    local f apache_out nginx_out http_code server_ip php_ver php_ok skip_html_files=0
+
+    php_ver=\$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION.".".PHP_RELEASE_VERSION;' 2>/dev/null || true)
+    php_ok=0
+    case "\$php_ver" in
+        8.5.*) dpkg --compare-versions "\$php_ver" ge 8.5.12 && php_ok=1 ;;
+        8.4.*) dpkg --compare-versions "\$php_ver" ge 8.4.27 && php_ok=1 ;;
+        8.3.*) dpkg --compare-versions "\$php_ver" ge 8.3.36 && php_ok=1 ;;
+        8.2.*) dpkg --compare-versions "\$php_ver" ge 8.2.35 && php_ok=1 ;;
+    esac
+    if [ "\$php_ok" -eq 1 ]; then
+        echo "PHP \$php_ver is patched for PHP2Shell (CVE-2026-109618, CVE-2026-109619)."
+    else
+        echo "ERROR: PHP \${php_ver:-not installed} is vulnerable to PHP2Shell. Need 8.2.35+, 8.3.36+, 8.4.27+, or 8.5.12+. PHP 8.1 is not supported. Run: sudo /opt/killbot/UpdateAll.sh" >&2
+        failed=1
+    fi
+
+    if ! check_html_decrypted; then
+        failed=1
+        skip_html_files=1
+    fi
+
+    if [ "\$skip_html_files" -eq 0 ]; then
+    for f in kb.php empty.php le_receive_cert.php empty_en.html empty_ru.html; do
+        if [ ! -f "/var/www/html/\$f" ]; then
+            echo "Error: missing file /var/www/html/\$f"
+            failed=1
+        fi
+    done
+    fi
+
+    if [ ! -f "\$KILLBOT_INSTALL_SCRIPT" ]; then
+        echo "Error: missing file \$KILLBOT_INSTALL_SCRIPT"
+        failed=1
+    fi
+
+    apache_out=\$(apache2ctl configtest 2>&1)
+    if echo "\$apache_out" | grep -q "Syntax OK"; then
+        echo "Apache configuration is correct."
+    else
+        echo "Error: Apache configuration is invalid:"
+        echo "\$apache_out"
+        failed=1
+    fi
+
+    nginx_out=\$(nginx -t 2>&1)
+    if echo "\$nginx_out" | grep -q "test is successful"; then
+        echo "Nginx configuration is correct."
+    else
+        echo "Error: Nginx configuration is invalid:"
+        echo "\$nginx_out"
+        failed=1
+    fi
+
+    if systemctl is-active --quiet apache2; then
+        echo "apache2 is running."
+    else
+        echo "Error: apache2 is not running."
+        failed=1
+    fi
+
+    if systemctl is-active --quiet nginx; then
+        echo "nginx is running."
+    else
+        echo "Error: nginx is not running."
+        failed=1
+    fi
+
+    server_ip=\$(curl -s --connect-timeout 10 http://checkip.amazonaws.com)
+    if [ -z "\$server_ip" ]; then
+        echo "Error: could not determine the server IP."
+        failed=1
+    else
+        echo "Waiting 6 seconds before http://\${server_ip}/kb.php..."
+        sleep 6
+        http_code=\$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "http://\${server_ip}/kb.php")
+        if [ "\$http_code" = "200" ]; then
+            echo "http://\${server_ip}/kb.php returned 200."
+        else
+            echo "Error: http://\${server_ip}/kb.php returned \${http_code:-no response} (expected 200)."
+            failed=1
+        fi
+    fi
+
+    if [ "\$skip_html_files" -eq 0 ]; then
+        if ! check_solver_health; then
+            failed=1
+        fi
+    fi
+
+    if [ "\$failed" -eq 0 ]; then
+        echo "KillBot is installed correctly."
+        return 0
+    fi
+    return 1
+}
+
+start() {
+    local failed=0
+    local f apache_out nginx_out
+
+    if ! ensure_html_decrypted; then
+        return 1
+    fi
+
+    for f in kb.php empty.php le_receive_cert.php empty_en.html empty_ru.html; do
+        if [ ! -f "/var/www/html/\$f" ]; then
+            echo "Error: missing file /var/www/html/\$f"
+            failed=1
+        fi
+    done
+
+    apache_out=\$(apache2ctl configtest 2>&1)
+    if echo "\$apache_out" | grep -q "Syntax OK"; then
+        echo "Apache configuration is correct."
+    else
+        echo "Error: Apache configuration is invalid:"
+        echo "\$apache_out"
+        failed=1
+    fi
+
+    nginx_out=\$(nginx -t 2>&1)
+    if echo "\$nginx_out" | grep -q "test is successful"; then
+        echo "Nginx configuration is correct."
+    else
+        echo "Error: Nginx configuration is invalid:"
+        echo "\$nginx_out"
+        failed=1
+    fi
+
+    if [ "\$failed" -ne 0 ]; then
+        return 1
+    fi
+
+    if ! systemctl start apache2; then
+        echo "Error: failed to start apache2."
+        return 1
+    fi
+    if ! systemctl start nginx; then
+        echo "Error: failed to start nginx."
+        return 1
+    fi
+
+    echo "apache2 is started."
+    echo "nginx is started."
+    status
+}
+
+stop() {
+    if ! systemctl stop apache2; then
+        echo "Error: failed to stop apache2."
+        return 1
+    fi
+    if ! systemctl stop nginx; then
+        echo "Error: failed to stop nginx."
+        return 1
+    fi
+
+    echo "apache2 is stopped."
+    echo "nginx is stopped."
+    return 0
+}
+
+# Command handling
+case "\$1" in
+    reload)
+        kb_require_no_args "\$@"
+        reload
+        ;;
+    ensite)
+        if [ "\$#" -lt 2 ] || [ "\$#" -gt 3 ]; then
+            echo "Usage: \$0 ensite domain [p]" 1>&2
+            echo "Exactly one domain is required. Wildcards are not allowed." 1>&2
+            exit 1
+        fi
+        kb_require_domain "\$2"
+        kb_require_ensite_opt "\$3"
+        ensite "\$2" "\$3"
+        ;;
+    dissite)
+        kb_require_one_domain "\$@"
+        dissite "\$2"
+        ;;
+    cert_del)
+        kb_require_one_domain "\$@"
+        cert_del "\$2"
+        ;;
+    a2dissite)
+        kb_require_one_domain "\$@"
+        a2dissite_domain "\$2"
+        ;;
+    remove)
+        kb_require_one_domain "\$@"
+        remove_domain "\$2"
+        ;;
+    status|check)
+        kb_require_no_args "\$@"
+        status
+        ;;
+    start)
+        kb_require_no_args "\$@"
+        start
+        ;;
+    stop)
+        kb_require_no_args "\$@"
+        stop
+        ;;
+    install)
+        install "\$2" "\$3" "\$4" "\$5" "\$6" "\$7" "\$8" "\$9" "\${10}" "\${11}" "\${12}" "\${13}" "\${14}" "\${15}" "\${16}" "\${17}" "\${18}" "\${19}" "\${20}" "\${21}" "\${22}" "\${23}" "\${24}" "\${25}" "\${26}" "\${27}" "\${28}" "\${29}" "\${30}"
+        ;;
+    *)
+        echo "Usage: kb {ensite|dissite|a2dissite|cert_del|remove|install|reload|status|check|start|stop} [domain]"
+        exit 1
+        ;;
+esac
+
+exit \$?
+EOF
+
+chmod +x /etc/init.d/kb
+
+if [ ! -L "/usr/local/bin/kb" ]; then
+    ln -sf /etc/init.d/kb /usr/local/bin/kb
+fi
+
+cat > /opt/killbot/install.sh <<EOF
+#!/bin/bash
+
+require_kb_status() {
+    if [[ "\${KB_STATUS_CHECKED:-0}" == "1" ]]; then
+        return 0
+    fi
+    local kb_bin=""
+    if command -v kb >/dev/null 2>&1; then
+        kb_bin="\$(command -v kb)"
+    elif [[ -x /usr/local/bin/kb ]]; then
+        kb_bin="/usr/local/bin/kb"
+    elif [[ -x /etc/init.d/kb ]]; then
+        kb_bin="/etc/init.d/kb"
+    else
+        echo "ERROR: kb is not installed; aborting install.sh" >&2
+        exit 1
+    fi
+    echo "Checking kb status..."
+    if ! "\$kb_bin" status; then
+        echo "ERROR: kb status failed; aborting install.sh" >&2
+        exit 1
+    fi
+    KB_STATUS_CHECKED=1
+    export KB_STATUS_CHECKED
+}
+
+require_kb_status
+
+sudo a2enmod setenvif >/dev/null 2>&1 || true
+sudo tee /etc/apache2/conf-available/killbot-logformat.conf > /dev/null <<'KBLOGFMT'
+# combined + kbRes kbUserID kbSession kbCheck (NONE if the cookie is missing)
+SetEnvIf Request_URI "^" KB_LOG_KBRES=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBUSERID=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBSESSION=NONE
+SetEnvIf Request_URI "^" KB_LOG_KBCHECK=NONE
+SetEnvIf Cookie "(?:^|;\s*)kbRes=([^;]+)" KB_LOG_KBRES=\$1
+SetEnvIf Cookie "(?:^|;\s*)kbUserID=([^;]+)" KB_LOG_KBUSERID=\$1
+SetEnvIf Cookie "(?:^|;\s*)kbSession=([^;]+)" KB_LOG_KBSESSION=\$1
+SetEnvIf Cookie "(?:^|;\s*)kbCheck=([^;]+)" KB_LOG_KBCHECK=\$1
+
+LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\" %{KB_LOG_KBRES}e %{KB_LOG_KBUSERID}e %{KB_LOG_KBSESSION}e %{KB_LOG_KBCHECK}e" combined_kb
+KBLOGFMT
+sudo a2enconf killbot-logformat >/dev/null 2>&1 || true
+
+declare email=""
+declare token=""
+declare backend_ip=""
+declare folder=""
+declare domain=""
+declare www=-1
+declare le="1"
+declare wlip=\$(grep -vE '^\$' /opt/killbot/wl-ip | paste -sd ",")
+declare wlua=\$(grep -vE '^\$' /opt/killbot/wl-ua | paste -sd ",")
+declare wlpath=\$(grep -vE '^\$' /opt/killbot/wl-path | paste -sd ",")
+declare SSLCertificateFile=""
+declare SSLCertificateKeyFile=""
+declare cdn_domain=""
+declare cdn_paths=""
+declare cdn_static=""
+declare https="https"
+
+DNS_SERVERS=("77.88.8.8" "8.8.8.8")  # yandex, Google
+RANDOM_INDEX=\$(( \${#DNS_SERVERS[@]} > 0 ? RANDOM % \${#DNS_SERVERS[@]} : 0 ))
+DNS_LE_SERVER="\${DNS_SERVERS[\$RANDOM_INDEX]}"
+echo "DNS server: \$DNS_LE_SERVER"
+
+declare DNSServer="\$DNS_LE_SERVER"
+
+# Domain: letters, digits, hyphen, dot. No quotes, slashes, or globs.
+kb_install_valid_domain() {
+    local d="\$1"
+    local label
+    if [ -z "\$d" ] || [ "\${#d}" -gt 253 ]; then
+        return 1
+    fi
+    case "\$d" in
+        *..*|.*|*.|*.conf|*.lua|*.sh|*.load) return 1 ;;
+    esac
+    if [[ ! "\$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\$ ]]; then
+        return 1
+    fi
+    if [[ ! "\$d" =~ [A-Za-z] ]]; then
+        return 1
+    fi
+    local IFS='.'
+    for label in \$d; do
+        [ -z "\$label" ] && return 1
+        [ "\${#label}" -gt 63 ] && return 1
+        case "\$label" in
+            -*|*-) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# Email: local@domain. Local part is letters/digits/._-+ only.
+kb_install_valid_email() {
+    local e="\$1"
+    local user host
+    if [ -z "\$e" ] || [ "\${#e}" -gt 254 ]; then
+        return 1
+    fi
+    case "\$e" in
+        *@*) ;;
+        *) return 1 ;;
+    esac
+    user="\${e%%@*}"
+    host="\${e#*@}"
+    case "\$user" in
+        *@*) return 1 ;;
+    esac
+    case "\$host" in
+        *@*) return 1 ;;
+    esac
+    if [ -z "\$user" ] || [ "\${#user}" -gt 64 ]; then
+        return 1
+    fi
+    [[ "\$user" =~ ^[A-Za-z0-9._+-]+\$ ]] || return 1
+    kb_install_valid_domain "\$host"
+}
+
+kb_install_valid_token() {
+    local t="\$1"
+    [ -z "\$t" ] && return 1
+    [ "\${#t}" -gt 128 ] && return 1
+    [[ "\$t" =~ ^[A-Za-z0-9]+\$ ]]
+}
+
+# IPv4 or localhost (folder install uses localhost as backend).
+kb_install_valid_ip() {
+    local ip="\$1"
+    local o
+    [ "\$ip" = "localhost" ] && return 0
+    [[ "\$ip" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}\$ ]] || return 1
+    local IFS='.'
+    for o in \$ip; do
+        [ "\$o" -ge 0 ] && [ "\$o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# Whitelist item: full IPv4, or prefix "starts with" (77.75. / 77.75.155.).
+kb_install_valid_wlip_item() {
+    local ip="\$1"
+    local o
+    [ -z "\$ip" ] && return 1
+    [ "\${#ip}" -gt 15 ] && return 1
+    if [[ "\$ip" =~ ^([0-9]{1,3}\\.){1,3}\$ ]]; then
+        local IFS='.'
+        for o in \$ip; do
+            [ -z "\$o" ] && continue
+            [ "\$o" -ge 0 ] && [ "\$o" -le 255 ] || return 1
+        done
+        return 0
+    fi
+    kb_install_valid_ip "\$ip"
+}
+
+kb_install_valid_le() {
+    [ "\$1" = "0" ] || [ "\$1" = "1" ] || [ "\$1" = "2" ]
+}
+
+kb_install_valid_www() {
+    [ "\$1" = "-1" ] || [ "\$1" = "0" ] || [ "\$1" = "1" ]
+}
+
+kb_install_valid_https() {
+    [ "\$1" = "http" ] || [ "\$1" = "https" ]
+}
+
+kb_install_valid_cdns() {
+    [ "\$1" = "0" ] || [ "\$1" = "1" ] || [ "\$1" = "2" ]
+}
+
+# Optional http(s):// then the same hostname rules as -d.
+kb_install_valid_cdn() {
+    local c="\$1"
+    local host
+    [ -z "\$c" ] && return 0
+    [ "\${#c}" -gt 300 ] && return 1
+    host="\$c"
+    host="\${host#http://}"
+    host="\${host#https://}"
+    host="\${host%%/*}"
+    kb_install_valid_domain "\$host"
+}
+
+kb_install_valid_path_item() {
+    local p="\$1"
+    local path q
+    [ -z "\$p" ] && return 1
+    [ "\${#p}" -gt 256 ] && return 1
+    case "\$p" in
+        //*|*/../*|*/..|../*|..) return 1 ;;
+    esac
+    # Optional trailing $ = exact path match in lua. Nowhere else.
+    if [[ "\$p" == *\$ ]]; then
+        p="\${p%\$}"
+        [ -z "\$p" ] && return 1
+    fi
+    path="\$p"
+    # /index.php?route=check/simple or several pairs joined by &.
+    if [[ "\$p" == *\?* ]]; then
+        path="\${p%%\?*}"
+        q="\${p#*\?}"
+        [[ "\$q" == *\?* ]] && return 1
+        [[ "\$q" =~ ^[A-Za-z0-9._%-]+=[A-Za-z0-9._%/+-]*(&[A-Za-z0-9._%-]+=[A-Za-z0-9._%/+-]*)*\$ ]] || return 1
+    fi
+    [[ "\$path" =~ ^/[A-Za-z0-9._/-]*\$ ]]
+}
+
+kb_install_valid_csv() {
+    local list="\$1"
+    local kind="\$2"
+    local item
+    [ -z "\$list" ] && return 0
+    [ "\${#list}" -gt 8192 ] && return 1
+    case "\$list" in
+        ,*|*,|*,,*) return 1 ;;
+    esac
+    local IFS=','
+    for item in \$list; do
+        item="\${item#"\${item%%[![:space:]]*}"}"
+        item="\${item%"\${item##*[![:space:]]}"}"
+        [ -z "\$item" ] && return 1
+        case "\$kind" in
+            ip)
+                kb_install_valid_wlip_item "\$item" || return 1
+                ;;
+            ua)
+                [[ "\$item" =~ ^[A-Za-z0-9._-]+\$ ]] || return 1
+                ;;
+            path)
+                kb_install_valid_path_item "\$item" || return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+while [[ "\$#" -gt 0 ]]; do
+    if [[ -z "\$1" ]]; then
+        break
+    fi
+    case "\$1" in
+        -e)
+            email="\$2"; shift 2;;
+        -t)
+            token="\$2"; shift 2;;
+        -ip)
+            backend_ip="\$2"; shift 2;;
+        -f)
+            echo "Invalid install argument: -f is not allowed." >&2
+            exit 1
+            ;;
+        -cdn)
+            cdn_domain="\$2"; shift 2;;
+        -cdnp)
+            cdn_paths="\$2"; shift 2;;
+        -cdns)
+            cdn_static="\$2"; shift 2;;
+        -d)
+            domain="\$2"; shift 2;;
+        -wlip)
+            wlip="\$2"; shift 2;;
+        -https)
+            https="\$2"; shift 2;;
+        -wlua)
+            wlua="\$2"; shift 2;;
+        -wlpath)
+            wlpath="\$2"; shift 2;;
+        -le)
+            le="\$2"; shift 2;;
+        -www)
+            www="\$2"; shift 2;;
+        *)
+            trimmed="\$(echo -n "\$1" | xargs)"
+            [[ -n "\$trimmed" ]] && { echo "Unknown arg: '\$1'"; exit 1; } || shift 1
+            ;;
+    esac
+done
+
+if [[ -z "\$email" && -z "\$token" ]]; then
+    echo "Error: argument email (-e) or token (-t) is required" >&2
+    exit 1
+fi
+
+if [[ -z "\$backend_ip" ]]; then
+    echo "Error: argument ip (-ip) is required" >&2
+    exit 1
+fi
+
+if [[ -z "\$domain" ]]; then
+    echo "Error: argument domain (-d) is required" >&2
+    exit 1
+fi
+
+if ! kb_install_valid_domain "\$domain"; then
+    echo "Invalid domain." >&2
+    exit 1
+fi
+if [[ -n "\$email" ]] && ! kb_install_valid_email "\$email"; then
+    echo "Invalid email." >&2
+    exit 1
+fi
+if [[ -n "\$token" ]] && ! kb_install_valid_token "\$token"; then
+    echo "Invalid token." >&2
+    exit 1
+fi
+if [[ -n "\$backend_ip" ]] && ! kb_install_valid_ip "\$backend_ip"; then
+    echo "Invalid ip." >&2
+    exit 1
+fi
+if ! kb_install_valid_le "\$le"; then
+    echo "Invalid -le value." >&2
+    exit 1
+fi
+if ! kb_install_valid_www "\$www"; then
+    echo "Invalid -www value." >&2
+    exit 1
+fi
+if ! kb_install_valid_https "\$https"; then
+    echo "Invalid -https value." >&2
+    exit 1
+fi
+if [[ -n "\$cdn_static" ]] && ! kb_install_valid_cdns "\$cdn_static"; then
+    echo "Invalid -cdns value." >&2
+    exit 1
+fi
+if [[ -n "\$cdn_domain" ]] && ! kb_install_valid_cdn "\$cdn_domain"; then
+    echo "Invalid -cdn value." >&2
+    exit 1
+fi
+if [[ -n "\$cdn_paths" ]] && ! kb_install_valid_csv "\$cdn_paths" path; then
+    echo "Invalid -cdnp value." >&2
+    exit 1
+fi
+if ! kb_install_valid_csv "\$wlip" ip; then
+    echo "Invalid -wlip value." >&2
+    exit 1
+fi
+if ! kb_install_valid_csv "\$wlua" ua; then
+    echo "Invalid -wlua value." >&2
+    exit 1
+fi
+if ! kb_install_valid_csv "\$wlpath" path; then
+    echo "Invalid -wlpath value." >&2
+    exit 1
+fi
+
+echo "\$(date '+%F %T') install.sh pid=\$\$ ppid=\$PPID parent=[\$(ps -o args= -p \$PPID 2>/dev/null)] argv=[\$*]" >> /var/log/killbot/install_debug.log
+
+#check if www not set
+if [ "\$www" -eq -1 ]; then
+    if [[ \$domain == www.* ]]; then
+        www=1    
+    else
+        www=0        
+    fi
+fi
+
+domain_without_www=\${domain#www.}
+domain_with_www="www.\$domain_without_www"
+
+FILE1="/etc/apache2/sites-enabled/\$domain_without_www-killbot.conf"
+FILE2="/etc/apache2/sites-enabled/\$domain_without_www.conf"
+FILE3="/etc/nginx/sites-enabled/\$domain_without_www.conf"
+
+get_apache_hash() {
+    H1=\$(md5sum "\$FILE1" 2>/dev/null | awk '{print \$1}' || echo "\$FILE1")
+    H2=\$(md5sum "\$FILE2" 2>/dev/null | awk '{print \$1}' || echo "\$FILE2")
+    echo "\${H1}\${H2}" | md5sum | awk '{print \$1}'
+}
+
+get_nginx_hash() {
+    md5sum "\$FILE3" 2>/dev/null | awk '{print \$1}' || echo "\$FILE3"
+}
+
+# Reload or start a systemd service; retry up to 3 times with a short pause.
+kb_systemctl_retry() {
+    local action="\$1"
+    local service="\$2"
+    local attempt
+    for attempt in 1 2 3; do
+        if timeout 15 systemctl "\$action" "\$service"; then
+            return 0
+        fi
+        echo "Warning: \$service \$action failed (attempt \$attempt/3)"
+        if [ "\$attempt" -lt 3 ]; then
+            sleep 2
+        fi
+    done
+    echo "Error: \$service \$action failed"
+    return 1
+}
+
+CURRENT_APACHE_HASH=\$(get_apache_hash)
+CURRENT_NGINX_HASH=\$(get_nginx_hash)
+
+
+
+sudo mkdir -p /etc/apache2/ssl
+cd /etc/apache2/ssl
+
+certPath="/etc/apache2/ssl/\$domain_without_www-selfsigned.crt"
+
+if [[ ! -f "\$certPath" ]]; then
+    sudo openssl req -x509 -nodes -days 6650 -newkey rsa:2048 \
+        -keyout "\$domain_without_www-selfsigned.key" \
+        -out "\$domain_without_www-selfsigned.crt" \
+        -subj "/C=RU/ST=Moscow/L=Moscow/O=KillBot/OU=Killbot/CN=\$domain_without_www/emailAddress=\$email" \
+        -addext "subjectAltName = DNS:\$domain_without_www, DNS:*.\$domain_without_www"
+fi
+
+SSLCertificateFile="/etc/apache2/ssl/\$domain_without_www-selfsigned.crt"
+SSLCertificateKeyFile="/etc/apache2/ssl/\$domain_without_www-selfsigned.key"
+#self-signed cert by default
+
+server_config_error=0
+
+SERVER_IP=\$(curl -s http://checkip.amazonaws.com)
+
+# check if port 443 is opened
+output=\$(curl -v --connect-timeout 5 --max-time 10 --insecure https://\$backend_ip:443 2>&1)
+
+if echo "\$output" | grep -q "Connected to"; then
+    echo "Port 443 on the \$backend_ip server is opened"
+else
+    echo "ERROR: Port 443 is closed for \$backend_ip. The KillBot server has no access to the website server. Please open port 443 on your website server (\$backend_ip) for the KillBot server (\$SERVER_IP)."
+    server_config_error=1
+fi
+
+http_code=\$(curl -s -o /dev/null -w "%{http_code}" \
+  --connect-timeout 5 --max-time 10 \
+  --insecure \
+  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+  -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+  -H "Accept-Language: ru,en;q=0.9" \
+  --resolve \$domain:443:\$backend_ip \
+  https://\$domain)
+
+if [ "\$server_config_error" -eq 0 ] && [[ "\$http_code" =~ ^(200|301|302)$ ]]; then
+
+    echo "Domain \$domain correctly points to \$backend_ip (resolve check OK)"
+
+elif [ "\$server_config_error" -eq 0 ]; then
+    # fallback №1
+    http_code=\$(curl -s -o /dev/null -w "%{http_code}" \
+      --connect-timeout 5 --max-time 10 \
+      --insecure \
+      -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+      -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+      -H "Accept-Language: ru,en;q=0.9" \
+      -H "Host: \$domain" \
+      https://\$backend_ip/)
+
+    if [ "\$server_config_error" -eq 0 ] && [[ "\$http_code" =~ ^(200|301|302)$ ]]; then
+
+        echo "Domain \$domain works on \$backend_ip (Host header fallback, possible SNI/SSL issue)"
+
+    else
+        # fallback №2 (HTTP)
+        http_code=\$(curl -s -o /dev/null -w "%{http_code}" \
+          --connect-timeout 5 --max-time 10 \
+          -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+          -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+          -H "Accept-Language: ru,en;q=0.9" \
+          -H "Host: \$domain" \
+          http://\$backend_ip/)
+
+        if [ "\$server_config_error" -eq 0 ] && [[ "\$http_code" =~ ^(200|301|302)$ ]]; then
+
+            echo "Domain \$domain works on \$backend_ip via HTTP (HTTPS may be misconfigured)"
+
+        else
+
+            if [[ "\$http_code" == "000" ]]; then
+                echo "Domain \$domain is NOT reachable on \$backend_ip (no connection)"
+            else
+                echo echo "Domain \$domain is NOT configured on \$backend_ip (possible wrong IP address or missing virtual host)"
+            fi
+
+            server_config_error=1
+        fi
+    fi
+fi
+
+if [ "\$server_config_error" -eq 1 ]; then
+
+    SOURCE="/etc/nginx/sites-available/default"
+    TARGET="/etc/nginx/sites-available/\$domain_without_www.conf"
+    LINK="/etc/nginx/sites-enabled/\$domain_without_www.conf"
+
+    if [ ! -f "\$TARGET" ]; then
+        cp -f "\$SOURCE" "\$TARGET" || { echo "Error copy sites-available/default to /etc/nginx/sites-available/\$domain_without_www.conf"; exit 1; }
+
+        sed -i "s/server_name _;/server_name \$domain_without_www *.\$domain_without_www;/g" "\$TARGET"
+        
+
+        sed -i "s/listen 80 default_server;/listen 80;/g" "\$TARGET"
+        sed -i "s/listen 443 ssl default_server;/listen 443 ssl;/g" "\$TARGET"
+
+        sed -i "s|ssl_certificate      /etc/ssl/certs/ssl-cert-snakeoil.pem;|ssl_certificate \$SSLCertificateFile;|g" "\$TARGET"
+        sed -i "s|ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;|ssl_certificate_key \$SSLCertificateKeyFile;|g" "\$TARGET"
+    fi
+
+    # Enable the site
+    ln -sf "\$TARGET" "\$LINK" || true
+
+    nginx_check=\$(sudo nginx -t 2>&1)
+
+    if echo "\$nginx_check" | grep -q "test is successful"; then
+        echo "Nginx configuration for \$domain_without_www is correct."
+    else
+        echo "Nginx configuration error for \$domain_without_www: \$nginx_check"
+        exit 1
+    fi
+
+    # Validate and reload
+    nginx -t && systemctl reload nginx
+    if [ \$? -eq 0 ]; then
+        echo "Domain \$domain_without_www is set to default config"
+    else
+        echo "Error in nginx configuration"
+        rm -f "\$LINK" "\$TARGET"
+        exit 1
+    fi
+
+    exit 1
+fi
+
+if [ -z "\$folder" ]; then
+    folder="/var/www/html/\$domain_without_www"
+fi
+
+
+sudo mkdir -p /var/log/apache2/
+sudo chown -R www-data:www-data /var/log/apache2/
+sudo chmod -R 755 /var/log/apache2/
+
+ip_without_www_list=\$(dig @"\$DNSServer" +short "\$domain_without_www" A)
+ip_with_www_list=\$(dig @"\$DNSServer" +short "\$domain_with_www" A)
+resolved_ips=\$(dig @"\$DNSServer" +short "\$domain" A)
+
+#echo "Public server IP: \$SERVER_IP"
+
+certPath="/etc/letsencrypt/live/\$domain_without_www/fullchain.pem"
+
+if [[ "\$le" -ne 0 && ! -f "/opt/killbot/ssl/\$domain_without_www/fullchain.pem" ]]; then
+    # Check that SERVER_IP is present in at least one IP list
+    if ! echo "\$resolved_ips" | grep -Fxq "\$SERVER_IP" && \
+       ! echo "\$ip_without_www_list" | grep -Fxq "\$SERVER_IP" && \
+       ! echo "\$ip_with_www_list" | grep -Fxq "\$SERVER_IP"; then
+        echo "Error: Wait until at least one A record of the domain \$domain points to \$SERVER_IP"
+
+        SOURCE="/etc/nginx/sites-available/default"
+        TARGET="/etc/nginx/sites-available/\$domain_without_www.conf"
+        LINK="/etc/nginx/sites-enabled/\$domain_without_www.conf"
+
+        cp -f "\$SOURCE" "\$TARGET" || { echo "Error copy sites-available/default to /nginx/sites-available/DOMAIN"; exit 1; }
+        sed -i "s/server_name _;/server_name \$domain;/g" "\$TARGET"
+
+        sed -i "s/listen 80 default_server;/listen 80;/g" "\$TARGET"
+        sed -i "s/listen 443 ssl default_server;/listen 443 ssl;/g" "\$TARGET"
+
+        sed -i "s|ssl_certificate      /etc/ssl/certs/ssl-cert-snakeoil.pem;|ssl_certificate \$SSLCertificateFile;|g" "\$TARGET"
+        sed -i "s|ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;|ssl_certificate_key \$SSLCertificateKeyFile;|g" "\$TARGET"
+
+        # Enable the site
+        ln -sf "\$TARGET" "\$LINK"
+
+        nginx_check=\$(sudo nginx -t 2>&1)
+
+        if echo "\$nginx_check" | grep -q "test is successful"; then
+            echo "Nginx configuration for \$domain_without_www is correct."
+        else
+            echo "Nginx configuration error for \$domain_without_www: \$nginx_check"
+            exit 1
+        fi
+
+        # Validate and reload
+        nginx -t && systemctl reload nginx
+        if [ \$? -eq 0 ]; then
+            echo "Domains \$DOMAIN sets to default config"
+        else
+            echo "Error in nginx configuration"
+            rm -f "\$LINK" "\$TARGET"
+            exit 1
+        fi
+
+        exit 1
+    fi
+fi
+
+SSLCertificateFile="/etc/letsencrypt/live/\$domain_without_www/fullchain.pem"
+SSLCertificateKeyFile="/etc/letsencrypt/live/\$domain_without_www/privkey.pem"
+
+if [[ ! -f "\$certPath" && "\$le" -ne 0 && ! -f "/opt/killbot/ssl/\$domain_without_www/fullchain.pem" ]]; then
+
+   echo "Obtaining letsencrypt certificate...."
+
+    if [ -z "\$email" ]; then
+        echo "Error: Add -e [email] parametr to receive letsencript cert."
+        exit 1
+    fi
+    
+    output=\$(/opt/killbot/apache80_letsencrypt_test.sh "\$domain_without_www" "\$backend_ip")
+
+    if echo "\$output" | grep -q "created"; then
+        :
+    else
+        echo "Error: There is no confirmation of file creation in the script output:"
+        echo "\$output"
+        exit 1
+    fi
+    
+    apache_check=\$(sudo apachectl configtest 2>&1)
+
+    if echo "\$apache_check" | grep -q "Syntax OK"; then
+        :
+    else
+        echo "Apache configuration error for \$domain: \$apache_check"
+
+        sudo a2dissite "\$domain_without_www-le"
+        sudo rm -f "/etc/apache2/sites-available/\$domain_without_www-le.conf"
+
+        exit 1
+    fi
+
+    nginx_check=\$(sudo nginx -t 2>&1)
+
+    if echo "\$nginx_check" | grep -q "test is successful"; then
+        echo "Nginx configuration for \$domain_without_www is correct."
+    else
+        echo "Nginx configuration error for \$domain_without_www: \$nginx_check"
+        exit 1
+    fi
+    
+    sudo a2ensite "\$domain_without_www-le"
+    sudo ln -sf /etc/nginx/sites-available/\$domain_without_www.conf /etc/nginx/sites-enabled/
+
+    sudo a2dissite "\$domain_without_www"
+    sudo a2dissite "\$domain_without_www-killbot"    
+    sudo systemctl reload apache2
+    sudo systemctl nginx reload
+
+    echo "The site \$domain_without_www-le has been successfully enabled and Apache has been restarted."
+    
+    sudo rm -rf /etc/letsencrypt/live/"\$domain_without_www"\*
+    sudo rm -rf /etc/letsencrypt/archive/"\$domain_without_www"\*
+    sudo rm -rf /etc/letsencrypt/renewal/"\$domain_without_www"\*.conf
+
+    if [[ "\$le" -eq 2 ]]; then
+        echo "Error: le=2 not supported!"
+        exit 1;
+
+        output=\$(dig @"\$DNSServer" +short AAAA "\$domain_without_www")
+            if echo "\$output" | grep -q .; then
+                echo "ERROR: remove AAAA dns record for \$domain_without_www"        
+                exit 1;
+            fi
+
+        output=\$(sudo certbot certonly --manual --preferred-challenges=dns \
+          --cert-name "\$domain_without_www" \
+          -d "\$domain_without_www" \
+          -d "*.\$domain_without_www" \
+          --email "\$email" \
+          --agree-tos \          
+          --manual-public-ip-logging-ok \
+          --expand \
+          2>&1)
+
+        # Check result and show DNS instructions if needed
+        if [[ \$? -ne 0 ]]; then
+            echo "Error obtaining SSL certificate:"
+            echo "\$output"
+
+            # Try to extract DNS record information
+            if grep -q "Please deploy a DNS TXT record" <<< "\$output"; then
+                echo -e "\n\033[1;31mATTENTION: You need to manually add a DNS record:\033[0m"
+                # Extract record name and value
+                dns_record=\$(grep -oP "acme-challenge\.[^\s]+" <<< "\$output" | head -1)
+                dns_value=\$(grep -oP 'TXT record \K[^\s]+' <<< "\$output" | head -1)
+
+                echo -e "Add this TXT record to your DNS zone:"
+                echo -e "Name: \033[1;32m_\$dns_record\033[0m"
+                echo -e "Value: \033[1;32m\$dns_value\033[0m"
+                echo -e "TTL: 300 (or default value)"
+                echo -e "\nAfter adding, wait 2-5 minutes for DNS propagation and try again."
+
+                echo -e "\nYou can verify DNS propagation with:"
+                echo -e "dig -t TXT _acme-challenge.\$domain_without_www +short"
+            fi
+            exit 1
+        else
+            echo -e "\033[1;32mSuccess! Wildcard certificate obtained for:\033[0m"
+            echo "- Primary domain: \$domain"
+            echo "- All subdomains: *.\$domain_without_www"
+
+            echo -e "\nCertificate details:"
+            sudo certbot certificates --cert-name "\$domain_without_www"
+        fi
+
+    else
+        if echo "\$ip_without_www_list" | grep -Fxq "\$SERVER_IP" && \
+            echo "\$ip_with_www_list"    | grep -Fxq "\$SERVER_IP"; then
+
+            output=\$(dig @"\$DNSServer" +short AAAA "\$domain_without_www")
+            if echo "\$output" | grep -Eq '^[0-9a-fA-F:]+\$'; then
+                echo "ERROR: remove AAAA dns record for \$domain_without_www"
+                exit 1
+            fi
+
+            output=\$(dig @"\$DNSServer" +short AAAA "\$domain_with_www")
+            if echo "\$output" | grep -Eq '^[0-9a-fA-F:]+\$'; then
+                echo "ERROR: remove AAAA dns record for \$domain_with_www"
+                exit 1
+            fi
+
+            output=\$(sudo certbot certonly --webroot --cert-name "\$domain_without_www" -w /var/www/html -d "\$domain_without_www" -d "\$domain_with_www" --email "\$email" --agree-tos --non-interactive 2>&1)
+        else
+
+            output=\$(dig @"\$DNSServer" +short AAAA "\$domain_without_www")
+            if echo "\$output" | grep -Eq '^[0-9a-fA-F:]+\$'; then
+                echo "ERROR: remove AAAA dns record for \$domain_without_www"
+                exit 1
+            fi
+
+            output=\$(sudo certbot certonly --webroot --cert-name "\$domain_without_www" -w /var/www/html -d "\$domain" --email "\$email" --agree-tos --non-interactive 2>&1)
+        fi
+    fi
+
+    if echo "\$output" | grep -q -E "Congratulations|Successfully";  then
+        
+        SSLCertificateFile="/etc/letsencrypt/live/\$domain_without_www/fullchain.pem"
+        SSLCertificateKeyFile="/etc/letsencrypt/live/\$domain_without_www/privkey.pem"
+
+        echo "The certificate has been successfully obtained."
+
+        sudo a2dissite "\$domain_without_www-le"
+        sudo rm -f "/etc/apache2/sites-available/\$domain_without_www-le.conf"
+
+    else
+        echo "Error obtaining the certificate: \$output"
+        exit 1
+    fi   
+
+fi
+
+if [[ "\$le" -eq 0 ]]; then
+    SSLCertificateFile="/etc/apache2/ssl/\$domain_without_www-selfsigned.crt"
+    SSLCertificateKeyFile="/etc/apache2/ssl/\$domain_without_www-selfsigned.key"
+fi
+
+# Check is sert is on: (enabled != 0)
+enabled_file="/opt/killbot/ssl/\$domain_without_www/enabled"
+enabled_value="1"
+if [[ -f "\$enabled_file" ]]; then
+    enabled_value=\$(cat "\$enabled_file" 2>/dev/null || echo "1")
+fi
+if [[ "\$enabled_value" != "0" ]]; then
+    if [[ -f "/opt/killbot/ssl/\$domain_without_www/privkey.pem" ]]; then
+      SSLCertificateFile="/opt/killbot/ssl/\$domain_without_www/fullchain.pem"
+      SSLCertificateKeyFile="/opt/killbot/ssl/\$domain_without_www/privkey.pem"
+      echo "Custom SSL certificate is used!"
+
+        # Delete the Let's Encrypt certificate without a prompt
+        certbot delete --cert-name "\$domain_without_www" --non-interactive
+    fi
+fi
+
+
+make_lua_array() {
+    local varname="\$1"
+    local values="\$2"
+    local result="local \$varname = {"
+    IFS=',' read -ra arr <<< "\$values"
+    for val in "\${arr[@]}"; do
+        val="\${val//\\"/\\\\\"}"  
+        result+="    \"\$val\","
+    done
+    result+="}"
+    echo -e "\$result"
+}
+
+is_wildcard_cert() {
+  local certfile="\$1"  
+  if [[ ! -f "\$certfile" ]]; then return 1; fi
+
+  #get domain from certpath like "SERTDIR/{domain}/fullchain.pem"
+  local domain=\$(echo "\$certfile" | rev | cut -d'/' -f2 | rev)
+
+  mapfile -t dns_entries < <(openssl x509 -in "\$certfile" -noout -text 2>/dev/null | grep -oP 'DNS:[^,]+' | sed 's/^DNS://')
+  for n in "\${dns_entries[@]}"; do
+    if [[ "\$n" == "*.\$domain" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wlpath="\$wlpath,/.well-known/"
+
+lua_agents=\$(make_lua_array "allowed_agents" "\$wlua")
+lua_paths=\$(make_lua_array "allowed_paths" "\$wlpath")
+lua_ips=\$(make_lua_array "allowed_ips" "\$wlip")
+
+subdomain_alias=""
+if is_wildcard_cert "\$SSLCertificateFile"; then
+    subdomain_alias="ServerAlias *.\$domain_without_www"
+    echo "Wildcard certificate detected: \$SSLCertificateFile. Configuring Apache for all subdomains"
+
+    log_file="/var/log/killbot/setup_killbot_reverse_proxy_\$(echo "\$domain_without_www" | sed 's/[^a-zA-Z0-9._-]/_/g').log"
+    nohup /opt/killbot/setup_killbot_reverse_proxy.sh "\$domain_without_www" -y >> "\$log_file" 2>&1 </dev/null &
+    echo "OK: setup_killbot_reverse_proxy started in background (log: \$log_file)"
+else
+    echo "Wildcard certificate not detected. Removing killbot_revers files for \$domain_without_www"
+    rm -f \
+        "/opt/killbot/settings/\$domain_without_www/killbot_revers" \
+        "/opt/killbot/settings/\$domain_without_www/killbot_revers_checked"
+fi
+
+
+if [[ "\$le" -eq 0 ]]; then    
+    subdomain_alias="ServerAlias *.\$domain_without_www"
+    echo "For self signed serts configure Apache for all subdomains"
+fi
+
+# sed replacement: & means "the matched text", so a query & would become kb_lua_paths.
+kb_sed_repl() {
+    local s="\$1"
+    s="\${s//\\\\/\\\\\\\\}"
+    s="\${s//&/\\\\&}"
+    s="\${s//|/\\\\|}"
+    printf '%s' "\$s"
+}
+
+#Updating kb.lua
+lua_paths_sed="\$(kb_sed_repl "\$lua_paths")"
+lua_agents_sed="\$(kb_sed_repl "\$lua_agents")"
+lua_ips_sed="\$(kb_sed_repl "\$lua_ips")"
+domain_sed="\$(kb_sed_repl "\$domain_without_www")"
+sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" -e "s|kb_lua_paths|\${lua_paths_sed}|g" -e "s|kb_lua_ips|\${lua_ips_sed}|g" /opt/killbot/kb.lua > /opt/killbot/lua/\$domain_without_www.lua
+
+
+
+#sudo chown -R www-data:www-data /opt/killbot/php/\$domain_without_www.php
+#chmod 755 /opt/killbot/php/\$domain_without_www.php
+
+#Updating apache443-killbot.sh
+sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443-killbot.sh > /opt/killbot/sh/\$domain_without_www-killbot.sh
+sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443.sh > /opt/killbot/sh/\$domain_without_www.sh
+
+#Disable SSL if the domain does not have "www"
+if [[ "\$ip_without_www_list" == "\$ip_with_www_list" && -n "\$ip_without_www_list" ]]; then
+    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /opt/killbot/sh/\$domain_without_www-killbot.sh    
+else
+    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /opt/killbot/sh/\$domain_without_www-killbot.sh    
+fi
+
+sudo chmod +x /opt/killbot/sh/\$domain_without_www-killbot.sh /opt/killbot/sh/\$domain_without_www.sh
+
+#Determine the primary mirror based on the www variable
+if [ "\$www" -eq 0 ]; then
+    main_domain="\$domain_without_www"
+    secondary_domain="www.\$domain_without_www"
+else
+    main_domain="www.\$domain_without_www"
+    secondary_domain="\$domain_without_www"
+fi
+
+# Creating an Apache configuration file with KillBot support so that the site opens through the KillBot verification screen.
+output=\$(/opt/killbot/sh/\$domain_without_www-killbot.sh "\$domain_without_www" "\$main_domain" "\$secondary_domain" "\$backend_ip" "\$wlua" "\$wlpath" "\$wlip" "\$cdn_static" "\$cdn_domain" "\$cdn_paths" "\$https")
+
+if echo "\$output" | grep -q "created"; then
+    echo "The Apache file with the KillBot screen on port 443 has been created."
+else
+    echo "Error: There is no confirmation of file creation in the script output."
+    echo "Script output: \$output"
+    exit 1
+fi
+
+# Creating an Apache configuration file without KillBot support - simple proxying.
+#output=\$(/opt/killbot/apache443.sh "\$domain_without_www" "\$backend_ip" "\$folder")
+output=\$(/opt/killbot/sh/\$domain_without_www.sh "\$domain_without_www" "\$main_domain" "\$secondary_domain" "\$backend_ip" "\$https")
+
+
+if echo "\$output" | grep -q "created"; then
+    echo "The Apache file without KillBot on port 443 has been created."
+else
+    echo "Error: There is no confirmation of file creation in the script output."
+    echo "Script output: \$output"
+    exit 1
+fi
+
+# Disable SSL if the domain does not have www
+if [[ "\$ip_without_www_list" == "\$ip_with_www_list" && -n "\$ip_without_www_list" ]]; then
+    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /etc/apache2/sites-available/\$domain_without_www.conf    
+else
+    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /etc/apache2/sites-available/\$domain_without_www.conf
+fi
+
+if [ "\$backend_ip" != "localhost" ]; then
+    echo "The Apache server for the site \$domain_without_www is configured as a reverse proxy to IP=\$backend_ip"
+    sed -i "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g" /etc/apache2/sites-available/\$domain_without_www-killbot.conf
+    sed -i "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g" /etc/apache2/sites-available/\$domain_without_www.conf
+else
+    echo "The Apache server for the site \$domain_without_www is configured to the localhost directory \$folder"
+fi
+
+sed -i 's|\.access\.log combined\$|.access.log combined_kb|' /etc/apache2/sites-available/\$domain_without_www-killbot.conf
+
+apache_check=\$(sudo apachectl configtest 2>&1)
+
+if echo "\$apache_check" | grep -q "Syntax OK"; then
+    echo "Apache configuration is correct."
+else
+    echo "Apache configuration error: \$apache_check"
+
+    #sudo a2dissite "\$domain_without_www"
+    #sudo rm -f "/etc/apache2/sites-available/\$domain_without_www.conf"
+
+    exit 1
+fi
+
+sudo rm -f /etc/apache2/sites-enabled/\$domain_without_www-killbot.conf
+sudo rm -f /etc/apache2/sites-enabled/\$domain_without_www.conf
+sudo rm -f /etc/nginx/sites-enabled/\$domain_without_www.conf
+
+sudo a2dissite "\$domain_without_www"
+sudo a2ensite "\$domain_without_www-killbot"
+sudo ln -sf /etc/nginx/sites-available/\$domain_without_www.conf /etc/nginx/sites-enabled/
+
+apache_check=\$(sudo apachectl configtest 2>&1)
+
+if echo "\$apache_check" | grep -q "Syntax OK"; then
+    echo "Apache configuration is correct."
+else
+    echo "Apache configuration error: \$apache_check"
+
+    #sudo a2dissite "\$domain_without_www"
+    #sudo rm -f "/etc/apache2/sites-available/\$domain_without_www.conf"
+
+    exit 1
+fi
+
+nginx_check=\$(sudo nginx -t 2>&1)
+
+if echo "\$nginx_check" | grep -q "test is successful"; then
+    echo "Nginx configuration is correct."
+else
+    echo "Nginx configuration error: \$nginx_check"
+    exit 1
+fi
+
+NEW_APACHE_HASH=\$(get_apache_hash)
+NEW_NGINX_HASH=\$(get_nginx_hash)
+
+if [ "\$CURRENT_APACHE_HASH" != "\$NEW_APACHE_HASH" ]; then
+    echo "Reloading apache..."
+    if systemctl is-active --quiet apache2; then
+        kb_systemctl_retry reload apache2 || exit 1
+    else
+        kb_systemctl_retry start apache2 || exit 1
+    fi
+    echo "\$(date '+%F %T') install.sh reloaded apache: \$CURRENT_APACHE_HASH != \$NEW_APACHE_HASH" >> /var/log/killbot/install_debug.log || true
+fi
+
+if [ "\$CURRENT_NGINX_HASH" != "\$NEW_NGINX_HASH" ]; then
+    echo "Reloading nginx..."
+    if systemctl is-active --quiet nginx; then
+        kb_systemctl_retry reload nginx || exit 1
+    else
+        kb_systemctl_retry start nginx || exit 1
+    fi
+    echo "\$(date '+%F %T') install.sh reloaded nginx: \$CURRENT_NGINX_HASH != \$NEW_NGINX_HASH" >> /var/log/killbot/install_debug.log || true
+fi
+
+if [ "\$backend_ip" != "localhost" ]; then
+    POSTROUTING_FILE="/opt/killbot/postrouting.txt"
+    touch "\$POSTROUTING_FILE" 2>/dev/null || true
+    if ! grep -Fxq "\$backend_ip" "\$POSTROUTING_FILE" 2>/dev/null; then
+        echo "\$backend_ip" >> "\$POSTROUTING_FILE" || true
+        postrouting_log_file="/var/log/killbot/update_postrouting.log"
+        nohup /opt/killbot/update-postrouting.sh >> "\$postrouting_log_file" 2>&1 </dev/null &
+        echo "OK: update-postrouting started in background (log: \$postrouting_log_file)"
+    fi
+fi
+
+
+if [ "\$backend_ip" != "localhost" ]; then
+    echo "Success: Killbot configuration with verification page for domain \$domain_without_www is configured as a reverse proxy to IP=\$backend_ip"
+else
+    echo "Success: Killbot configuration with verification page for domain \$domain_without_www  is configured to the localhost directory \$folder"
+fi
+
+EOF
+
+sudo chmod +x /opt/killbot/install.sh
+
+# Web config runs these via kb.php as www-data. Do not allow www-data to replace them.
+chown root:root /opt/killbot/install.sh /opt/killbot/check_host_curl.sh /opt/killbot/read_apache_log.sh /etc/init.d/kb
+chmod 755 /opt/killbot/install.sh /opt/killbot/check_host_curl.sh /opt/killbot/read_apache_log.sh /etc/init.d/kb
+
+# Drop /usr/bin/nice from sudoers (sudo nice = arbitrary root). Keep install.sh, kb, checkers.
+SUDOERS_DROP=(
+    "www-data ALL=(ALL) NOPASSWD: /usr/bin/nice, /opt/killbot/install.sh"
+    "www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb"
+    "www-data ALL=(ALL) NOPASSWD: /opt/killbot/install.sh"
+    "www-data ALL=(ALL) NOPASSWD: /opt/killbot/check_host_curl.sh"
+    "www-data ALL=(ALL) NOPASSWD: /opt/killbot/read_apache_log.sh"
+)
+# visudo rejects files in world-writable dirs (/tmp). Keep the check copy in /root.
+# Check the rewritten main file without @includedir so a foreign drop-in
+# (wrong mode or syntax) cannot block the cleanup.
+SUDOERS_TMP="/root/.killbot-sudoers.check"
+grep -Fxv -f <(printf '%s\n' "${SUDOERS_DROP[@]}") /etc/sudoers > "$SUDOERS_TMP" || true
+sed -E '/^[[:space:]]*[@#]includedir[[:space:]]/d' "$SUDOERS_TMP" > "${SUDOERS_TMP}.noint"
+if ! visudo -c -f "${SUDOERS_TMP}.noint"; then
+    echo "ERROR: sudoers cleanup failed validation; /etc/sudoers left unchanged" >&2
+    rm -f "$SUDOERS_TMP" "${SUDOERS_TMP}.noint"
+    exit 1
+fi
+cat "$SUDOERS_TMP" > /etc/sudoers
+chmod 440 /etc/sudoers
+rm -f "$SUDOERS_TMP" "${SUDOERS_TMP}.noint"
+
+# Quoted heredoc + strip CR so Windows line endings cannot break visudo.
+# Validate the fragment in /root first (visudo skips names with '.' in sudoers.d).
+SUDOERS_DROPIN="/root/.killbot-sudoers.d.check"
+cat > "$SUDOERS_DROPIN" <<'EOF'
+www-data ALL=(ALL) NOPASSWD: /opt/killbot/install.sh
+www-data ALL=(ALL) NOPASSWD: /opt/killbot/check_host_curl.sh
+www-data ALL=(ALL) NOPASSWD: /opt/killbot/read_apache_log.sh
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb ensite *
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb ensite * p
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb dissite *
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb a2dissite *
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb cert_del *
+www-data ALL=(ALL) NOPASSWD: /etc/init.d/kb remove *
+EOF
+tr -d '\r' < "$SUDOERS_DROPIN" > "${SUDOERS_DROPIN}.lf"
+mv "${SUDOERS_DROPIN}.lf" "$SUDOERS_DROPIN"
+if ! visudo -c -f "$SUDOERS_DROPIN"; then
+    echo "ERROR: /etc/sudoers.d/killbot failed visudo syntax check" >&2
+    rm -f "$SUDOERS_DROPIN"
+    exit 1
+fi
+cp "$SUDOERS_DROPIN" /etc/sudoers.d/killbot
+rm -f "$SUDOERS_DROPIN"
+chown root:root /etc/sudoers.d/killbot
+chmod 440 /etc/sudoers.d/killbot
+# Full visudo -c also parses every other drop-in. sudo already ignores
+# fragments with mode != 0440; do not chmod them (that would enable rules
+# that are currently ignored) and do not roll back our valid killbot file.
+visudo_rc=0
+visudo_out="$(visudo -c 2>&1)" || visudo_rc=$?
+echo "$visudo_out"
+if [ "$visudo_rc" -ne 0 ]; then
+    if echo "$visudo_out" | grep -F '/etc/sudoers.d/killbot:' | grep -qv 'parsed OK'; then
+        echo "ERROR: /etc/sudoers.d/killbot is invalid" >&2
+        rm -f /etc/sudoers.d/killbot
+        exit 1
+    fi
+    if echo "$visudo_out" | grep -F '/etc/sudoers:' | grep -qv 'parsed OK'; then
+        echo "ERROR: /etc/sudoers failed visudo after rewrite" >&2
+        exit 1
+    fi
+    echo "WARNING: visudo -c reported problems in files other than /etc/sudoers.d/killbot." >&2
+    echo "WARNING: sudo ignores drop-ins that are not mode 0440; leaving those files unchanged." >&2
+    ls -la /etc/sudoers.d >&2 || true
+fi
+
+SERVER_IP=$(curl -s http://checkip.amazonaws.com)
+#echo "Public server IP: $SERVER_IP"
+
+# Adding blocking rules to prevent the site from being accessed by IP address
+#BLOCK_RULES_80="\n<VirtualHost 127.0.0.1:8080>\n    ServerName $SERVER_IP\n    <Location '/kb.php'>\n        Require all granted\n    </Location>\n    <Location '/'>\n        Require all denied\n        ErrorDocument 403 'Forbidden'\n    </Location>\n</VirtualHost>\n"
+#BLOCK_RULES_443="\n<VirtualHost 127.0.0.1:8443>\n    ServerName $SERVER_IP\n    <Location '/kb.php'>\n        Require all granted\n    </Location>\n    <Location '/'>\n        Require all denied\n        ErrorDocument 403 'Forbidden'\n    </Location>\n</VirtualHost>\n"
+
+BLOCK_RULES_443="\n<VirtualHost 127.0.0.1:8443>\n    ServerName $SERVER_IP\n    ServerAlias 127.0.0.1 localhost\n    DocumentRoot /var/www/html\n\n    SSLEngine on\n    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem\n    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key\n\n    <Directory \"/var/www/html\">\n        Require all denied\n        <Files \"kb.php\">\n            Require all granted\n        </Files>\n        <Files \"le_receive_cert.php\">\n            Require all granted\n        </Files>\n    </Directory>\n\n</VirtualHost>\n"
+BLOCK_RULES_80="\n<VirtualHost 127.0.0.1:8080>\n    ServerName $SERVER_IP\n    DocumentRoot /var/www/html\n\n      RewriteEngine On\n\n    RewriteCond %{REQUEST_METHOD} ^OPTIONS\n\n    RewriteRule .* - [R=403,L]\n\n  <Directory \"/var/www/html\">\n        Require all denied\n        <Files \"kb.php\">\n            Require all granted\n        </Files>\n        <Files \"le_receive_cert.php\">\n            Require all granted\n        </Files>\n    </Directory>\n\n</VirtualHost>\n"
+
+FILE="/etc/apache2/sites-available/000-default.conf"
+if [ -f "$FILE" ]; then
+    if ! grep -q "ServerName $SERVER_IP" "$FILE"; then
+        echo -e "$BLOCK_RULES_80" | sudo tee -a "$FILE" > /dev/null
+        echo "HTTP IP rules added to $FILE"
+    fi
+    if ! awk -v ip="$SERVER_IP" '
+        /<VirtualHost 127.0.0.1:8443>/ { in_v=1; block="" }
+        in_v { block = block $0 "\n" }
+        in_v && /<\/VirtualHost>/ {
+            if (block ~ ("ServerName " ip)) { found=1 }
+            in_v=0
+        }
+        END { exit !found }
+    ' "$FILE"; then
+        echo -e "$BLOCK_RULES_443" | sudo tee -a "$FILE" > /dev/null
+        echo "HTTPS IP vhost added to $FILE"
+    else
+        echo "Rules already exist in $FILE"
+    fi
+else
+    echo "File $FILE not found, skipping..."
+fi
+
+# Stopping Apache before making changes
+sudo systemctl stop apache2
+
+# Changing the number of concurrent connections. Modifying KeepAliveTimeout configuration and
+CONFIG_FILE="/etc/apache2/apache2.conf"
+MPM_PREFORK_FILE="/etc/apache2/mods-available/mpm_prefork.conf"
+MPM_EVENT_FILE="/etc/apache2/mods-available/mpm_event.conf"
+MPM_WORKER_FILE="/etc/apache2/mods-available/mpm_worker.conf"
+
+if ! grep -qE '^[[:space:]]*ListenBacklog[[:space:]]' "$CONFIG_FILE"; then
+    echo "ListenBacklog 4096" | sudo tee -a "$CONFIG_FILE" > /dev/null
+    echo "ListenBacklog 4096 added to $CONFIG_FILE"
+fi
+
+# Set KeepAliveTimeout to 1 second
+sudo sed -i 's/^KeepAliveTimeout.*/KeepAliveTimeout 1/' "$CONFIG_FILE"
+
+# Set maximum number of concurrent connections in Apache
+sudo sed -i "s/^MaxRequestWorkers.*/MaxRequestWorkers $MAX_CONNECTIONS_WORKERS/" "$CONFIG_FILE"
+
+# Configure MPM settings (prefork, event, worker)
+for MPM_FILE in "$MPM_PREFORK_FILE" "$MPM_EVENT_FILE" "$MPM_WORKER_FILE"; do
+    if [ -f "$MPM_FILE" ]; then
+        sudo cp "$MPM_FILE" "$MPM_FILE.bak"
+        sudo sed -i "s/^\s*MaxRequestWorkers.*/    MaxRequestWorkers $MAX_CONNECTIONS_WORKERS/" "$MPM_FILE"
+        sudo sed -i "s/^\s*MaxConnectionsPerChild.*/    MaxConnectionsPerChild 1000/" "$MPM_FILE"
+
+        # Check whether ServerLimit is present
+        if grep -q "^\s*ServerLimit" "$MPM_FILE"; then
+            # If present, update it
+            sudo sed -i "s/^\s*ServerLimit.*/    ServerLimit $MAX_CONNECTIONS/" "$MPM_FILE"
+        else
+            # If missing, add it right after MaxRequestWorkers
+            sudo sed -i "/^\s*MaxRequestWorkers.*/a\    ServerLimit $MAX_CONNECTIONS" "$MPM_FILE"
+        fi
+
+    fi
+done
+
+
+# Set SSLSessionCache to 2MB if not already set
+SSL_CONF="/etc/apache2/mods-available/ssl.conf"
+echo "Checking and updating SSLSessionCache..."
+
+if [ -f "$SSL_CONF" ]; then
+    if grep -q "^SSLSessionCache.*2097152" "$SSL_CONF"; then
+        echo "SSLSessionCache is already set to 2097152 — no changes made."
+    elif grep -q "^SSLSessionCache" "$SSL_CONF"; then
+        # Replace the existing SSLSessionCache line with the desired value
+        sudo sed -i 's|^SSLSessionCache.*|SSLSessionCache shmcb:/var/cache/apache2/ssl_scache(33554432)|' "$SSL_CONF"
+        echo "SSLSessionCache updated to 2097152."
+    else
+        # If SSLSessionCache is not defined, append the correct value
+        echo "SSLSessionCache shmcb:/var/cache/apache2/ssl_scache(2097152)" | sudo tee -a "$SSL_CONF" > /dev/null
+        echo "SSLSessionCache set to 2097152."
+    fi
+else
+    echo "File $SSL_CONF not found! Exiting."
+    exit 1
+fi
+
+
+SYSCTL_CONF="/etc/sysctl.conf"
+
+# Lines to be added
+CONFIG_LINES=(
+"net.ipv6.conf.all.disable_ipv6 = 1"
+"net.ipv6.conf.default.disable_ipv6 = 1"
+"net.ipv6.conf.lo.disable_ipv6 = 1"
+)
+
+if [ ! -d /proc/sys/net/ipv6 ]; then
+    echo "IPv6 sysctl tree is absent on this kernel; skip disable_ipv6 keys."
+else
+echo "Checking and adding IPv6 disable settings to $SYSCTL_CONF..."
+
+for line in "${CONFIG_LINES[@]}"; do
+    # Escape dots for grep
+    escaped_line=$(echo "$line" | sed 's/\./\\./g')
+    if grep -q "^$escaped_line" "$SYSCTL_CONF"; then
+        echo "Already present: $line"
+    else
+        echo "$line" | sudo tee -a "$SYSCTL_CONF" > /dev/null
+        echo "Added: $line"
+    fi
+done
+fi
+
+# Apply changes immediately. Missing keys (no IPv6 /proc) must not stop install.
+echo "Applying sysctl settings..."
+kb_sysctl_p
+
+echo "IPv6 disable settings are applied and persisted."
+
+
+CONF_FILE="/etc/apache2/apache2.conf"
+MUTEX_LINE="#Mutex posixsem rewrite-map"
+
+#disable mutex
+if grep -Fxq "$MUTEX_LINE" "$CONF_FILE"; then
+    echo "mutex already exist in $CONF_FILE"
+else
+    echo "$MUTEX_LINE" | sudo tee -a "$CONF_FILE" > /dev/null
+    echo "mutex added to $CONF_FILE"
+fi
+
+# Path to configuration file
+MODSEC_DIR="/etc/modsecurity"
+
+# Create /etc/modsecurity directory if it doesn't exist
+sudo mkdir -p "$MODSEC_DIR"
+sudo rm -f "${MODSEC_DIR}/killbot-ip.conf" "${MODSEC_DIR}/killbot-bots.conf"
+
+MODSEC_FILE="${MODSEC_DIR}/killbot-slow.conf"
+# Create configuration file to prevent slow connections /etc/modsecurity/killbot-slow.conf
+cat > "$MODSEC_FILE" <<EOL
+# Enable request processing
+SecRuleEngine On
+
+# Record the request processing start time
+SecRule REQUEST_URI "@streq /opt/killbot/verification.php" \
+    "id:2001,phase:1,pass,nolog,setvar:tx.start_time=%{TIME}"
+
+# Check if processing time exceeds 5 seconds
+SecRule TX:START_TIME "@lt %{TIME}-5" \
+    "id:2002,phase:4,deny,status:408,msg:'Slow request detected',log,chain"
+SecRule REQUEST_URI "@streq /opt/killbot/verification.php"
+EOL
+
+
+CONFIG_FILE="/etc/apache2/mods-available/security2.conf"
+# Check if the line is already commented
+if grep -q '^\s*#\s*IncludeOptional /usr/share/modsecurity-crs/\*\.load' "$CONFIG_FILE"; then
+  echo "Line is already commented. Doing nothing."
+fi
+# If line is not commented, comment it out
+sed -i '/^\s*IncludeOptional \/usr\/share\/modsecurity-crs\/\*\.load/s/^/# /' "$CONFIG_FILE"
+
+# Path to Apache2 configuration file in systemd
+CONFIG_FILE="/etc/systemd/system/apache2.service.d/autorestart.conf"
+
+# Create configuration directory if it doesn't exist
+mkdir -p /etc/systemd/system/apache2.service.d
+
+# Create or modify configuration file
+echo "[Service]" > "$CONFIG_FILE"
+echo "Restart=always" >> "$CONFIG_FILE"
+echo "RestartSec=10" >> "$CONFIG_FILE"
+
+echo "🔧 Enabling nginx auto-restart via systemd..."
+# Create the systemd override directory
+mkdir -p /etc/systemd/system/nginx.service.d
+# Write the config
+cat > /etc/systemd/system/nginx.service.d/override.conf <<'EOF'
+[Service]
+# Increase the file descriptor limit
+LimitNOFILE=200000
+# Restart automatically on crash
+Restart=always
+RestartSec=10
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=10
+EOF
+
+
+
+
+echo "🔄 Reloading systemd..."
+systemctl daemon-reexec
+systemctl daemon-reload
+
+# Define variables for easy configuration
+APACHE_USER="www-data"
+SERVICE_NAME="apache2"
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit 1
+fi
+
+# 1. Configure system-wide file descriptor limit
+echo "Configuring system-wide file descriptors..."
+# Remove existing entry if present and append new value
+sed -i "/fs.file-max/d" /etc/sysctl.conf
+echo "fs.file-max = $MAX_OPEN_FILES_SYS" >> /etc/sysctl.conf
+kb_sysctl_p
+
+# 2. Configure user limits in limits.conf
+echo "Configuring user limits..."
+# Function to update or add limit
+update_limit() {
+    local user=$1
+    local type=$2
+    local limit=$3
+    local value=$4
+
+    # Escape special characters in user pattern
+    local user_pattern=$(sed 's/[][\.*^$]/\\&/g' <<< "$user")
+
+    # Update existing entry or append new one
+    sed -i "/^$user_pattern[[:space:]]\+$type[[:space:]]\+$limit/d" /etc/security/limits.conf
+    echo "$user        $type    $limit      $value" >> /etc/security/limits.conf
+}
+
+# Update limits for different users
+update_limit "$APACHE_USER" "soft" "nofile" "$MAX_OPEN_FILES"
+update_limit "$APACHE_USER" "hard" "nofile" "$MAX_OPEN_FILES"
+update_limit "*" "soft" "nofile" "$MAX_OPEN_FILES"
+update_limit "*" "hard" "nofile" "$MAX_OPEN_FILES"
+update_limit "root" "soft" "nofile" "$MAX_OPEN_FILES"
+update_limit "root" "hard" "nofile" "$MAX_OPEN_FILES"
+
+# 3. Configure systemd global limits
+echo "Configuring systemd global limits..."
+sed -i "/^DefaultLimitNOFILE=/d" /etc/systemd/system.conf
+echo "DefaultLimitNOFILE=$MAX_OPEN_FILES" >> /etc/systemd/system.conf
+
+# 4. Configure Apache service limits
+echo "Configuring Apache service limits..."
+mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d/
+cat << EOF > /etc/systemd/system/${SERVICE_NAME}.service.d/limit_nofile.conf
+[Service]
+Nice=0
+LimitNOFILE=$MAX_OPEN_FILES
+LimitNPROC=$MAX_PROCESSES
+EOF
+
+# 5. Configure PAM modules
+echo "Configuring PAM..."
+# Remove existing entry if present and append new value
+sed -i "/pam_limits\.so/d" /etc/pam.d/common-session
+echo "session required pam_limits.so" >> /etc/pam.d/common-session
+
+PAM_LINE="session required pam_limits.so"
+PAM_FILE="/etc/pam.d/sudo"
+
+# Check if the line already exists (exact match)
+if ! grep -Fxq "$PAM_LINE" "$PAM_FILE"; then
+    echo "$PAM_LINE" >> "$PAM_FILE"
+fi
+
+# Configuration file for Apache log rotation
+ROTATE_CONF="/etc/logrotate.d/apache2"
+
+# Check if the configuration file exists
+if [ ! -f "$ROTATE_CONF" ]; then
+    echo "Creating new Apache log rotation configuration"
+    cat <<EOF | sudo tee "$ROTATE_CONF"
+/var/log/apache2/*.log {
+    daily                      # Rotate logs daily
+    size 100M
+    missingok                 # Don't fail if log is missing
+    rotate 3                  # Keep only 3 days of logs
+    compress                  # Compress rotated logs
+    delaycompress             # Compress on next rotation cycle
+    notifempty                # Don't rotate empty logs
+    create 640 www-data adm       # Set proper permissions
+    sharedscripts             # Run scripts only once for all logs
+    postrotate                # Command to run after rotation
+        /usr/lib/apache2/apache2ctl graceful  # Graceful Apache restart
+    endscript
+}
+EOF
+else
+    echo "Updating existing log rotation configuration"
+    
+    # Update rotate parameter
+    if grep -q "rotate" "$ROTATE_CONF"; then
+        sudo sed -i 's/^\(\s*rotate\s*\)[0-9]\+/\13/' "$ROTATE_CONF"
+    else
+        sudo sed -i '/daily/a \    rotate 3' "$ROTATE_CONF"
+    fi
+
+    # Update size parameter
+    if grep -q "size" "$ROTATE_CONF"; then
+        sudo sed -i 's/^\(\s*size\s*\)[0-9]\+[kKmMgG]\?/\120M/' "$ROTATE_CONF"
+    else
+        sudo sed -i '/daily/a \    size 100M' "$ROTATE_CONF"
+    fi
+    
+    # Ensure compression is enabled
+    if ! grep -q "compress" "$ROTATE_CONF"; then
+        sudo sed -i '/rotate/a \    compress' "$ROTATE_CONF"
+    fi
+fi
+
+NGINX_ROTATE_CONF="/etc/logrotate.d/nginx"
+
+if [ ! -f "$NGINX_ROTATE_CONF" ]; then
+    echo "Creating new Nginx log rotation configuration"
+    cat <<EOF | sudo tee "$NGINX_ROTATE_CONF"
+/var/log/nginx/*.log /var/log/apache2/access-nginx.log {
+    daily
+    size 100M
+    missingok
+    rotate 3
+    compress
+    delaycompress
+    notifempty
+    create 640 www-data adm
+    sharedscripts
+    postrotate
+        [ -s /run/nginx.pid ] && kill -USR1 \`cat /run/nginx.pid\`
+    endscript
+}
+EOF
+else
+    echo "Updating existing Nginx log rotation configuration"
+
+    # Update rotate parameter
+    if grep -q "^[[:space:]]*rotate[[:space:]]" "$NGINX_ROTATE_CONF"; then
+        sudo sed -i 's/^\([[:space:]]*rotate[[:space:]]*\)[0-9]\+/\13/' "$NGINX_ROTATE_CONF"
+    else
+        sudo sed -i '/daily/a \    rotate 3' "$NGINX_ROTATE_CONF"
+    fi
+
+    # Update size parameter
+    if grep -q "^[[:space:]]*size[[:space:]]" "$NGINX_ROTATE_CONF"; then
+        sudo sed -i 's/^\([[:space:]]*size[[:space:]]*\)[0-9]\+[kKmMgG]\?/\120M/' "$NGINX_ROTATE_CONF"
+    else
+        sudo sed -i '/daily/a \    size 100M' "$NGINX_ROTATE_CONF"
+    fi
+fi
+
+
+# Display the final configuration
+echo "Current log rotation configuration:"
+echo "----------------------------------"
+cat "$ROTATE_CONF"
+echo "----------------------------------"
+echo "Apache log rotation is now configured to keep 3 days of logs"
+
+
+# Reload systemd configuration
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+
+mkdir -p /opt/killbot/sh /opt/killbot/lua
+cat > /opt/killbot/sh/waf_http_data.sh << 'WAF_HTTP_DATA_EOF'
+#!/bin/bash
+# Build /opt/killbot/lua/{domain}-waf.lua from WAF rules.
+# stdin: base64 JSON of rule groups (paths + params).
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 domain" >&2
+  exit 1
+fi
+
+domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+if ! printf '%s' "$domain" | grep -Eq '^[a-z0-9.-]+$' || printf '%s' "$domain" | grep -q '\.\.'; then
+  echo "invalid domain" >&2
+  exit 1
+fi
+
+mkdir -p /opt/killbot/lua
+b64_file=$(mktemp)
+trap 'rm -f "$b64_file"' EXIT
+cat > "$b64_file"
+
+php - "$domain" "$b64_file" << 'PHP'
+<?php
+$domain = isset($argv[1]) ? strtolower((string) $argv[1]) : '';
+$b64_file = isset($argv[2]) ? (string) $argv[2] : '';
+if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
+    fwrite(STDERR, "invalid domain\n");
+    exit(1);
+}
+$raw = preg_replace('/\s+/', '', (string) file_get_contents($b64_file));
+if ($raw === '' || !preg_match('/^[A-Za-z0-9+\/=]+$/', $raw)) {
+    fwrite(STDERR, "bad waf_http_data\n");
+    exit(1);
+}
+$json = base64_decode($raw, true);
+$decoded = json_decode((string) $json, true);
+if (!is_array($decoded)) {
+    fwrite(STDERR, "bad waf json\n");
+    exit(1);
+}
+$waf_on = 1;
+$admin_in = array();
+if (isset($decoded['rules']) || isset($decoded['admin']) || array_key_exists('waf_on', $decoded)) {
+    $rules = (isset($decoded['rules']) && is_array($decoded['rules'])) ? $decoded['rules'] : array();
+    $waf_on = !empty($decoded['waf_on']) ? 1 : 0;
+    $admin_in = (isset($decoded['admin']) && is_array($decoded['admin'])) ? $decoded['admin'] : array();
+}
+else {
+    $rules = $decoded;
+}
+
+$path_types = array('none', 'number', 'string', 'string_space', 'safe', 'safe_short');
+$value_types = array_merge($path_types, array('json', 'serialized', 'email', 'url', 'ip', 'uuid', 'date', 'bool', 'float', 'hex', 'base64', 'phone'));
+$body_types = array_merge($value_types, array('html', 'php', 'js'));
+
+function waf_keep($value, $allowed) {
+    $value = (string) $value;
+    return in_array($value, $allowed, true) ? $value : '';
+}
+
+function waf_list($values, $allowed) {
+    if (!is_array($values)) {
+        return array();
+    }
+    $out = array();
+    foreach ($values as $value) {
+        $value = waf_keep($value, $allowed);
+        if ($value !== '' && !in_array($value, $out, true)) {
+            $out[] = $value;
+        }
+    }
+    return $out;
+}
+
+function waf_len($value) {
+    $length = (int) $value;
+    if ($length < 0) {
+        return 0;
+    }
+    if ($length > 10000000) {
+        return 10000000;
+    }
+    return $length;
+}
+
+function waf_quote($value) {
+    $value = str_replace(array("\\", "'", "\r", "\n", "\0"), array("\\\\", "\\'", "", "", ""), (string) $value);
+    return "'" . $value . "'";
+}
+
+function waf_lua_strings($values) {
+    $parts = array();
+    foreach ($values as $value) {
+        $parts[] = waf_quote($value);
+    }
+    return '{' . implode(',', $parts) . '}';
+}
+
+$lua_rules = array();
+foreach (array_slice($rules, 0, 200) as $group) {
+    if (!is_array($group)) {
+        continue;
+    }
+    $paths_in = isset($group['paths']) && is_array($group['paths']) ? $group['paths'] : array();
+    $params_in = isset($group['params']) && is_array($group['params']) ? $group['params'] : array();
+    $paths = array();
+    foreach (array_slice($paths_in, 0, 30) as $path) {
+        if (!is_array($path)) {
+            continue;
+        }
+        $mask = isset($path['mask']) ? trim((string) $path['mask']) : '';
+        if ($mask === '' || (isset($mask[0]) && $mask[0] !== '/' && $mask[0] !== '*')) {
+            continue;
+        }
+        if (preg_match('/[\s\'"`;\\\\<>|#&=]/', $mask) || strpos($mask, '..') !== false) {
+            continue;
+        }
+        if (strlen($mask) > 1024) {
+            $mask = substr($mask, 0, 1024);
+        }
+        $paths[] = array(
+            'mask' => $mask,
+            'allow_get' => !empty($path['allow_get']) ? 1 : 0,
+            'allow_post' => !empty($path['allow_post']) ? 1 : 0,
+            'max_length' => waf_len(isset($path['max_length']) ? $path['max_length'] : 0),
+            'validators' => waf_list(isset($path['validators']) ? $path['validators'] : array(), $path_types),
+        );
+    }
+    if (!$paths) {
+        continue;
+    }
+    $params = array();
+    foreach (array_slice($params_in, 0, 40) as $param) {
+        if (!is_array($param)) {
+            continue;
+        }
+        $name = isset($param['name']) ? trim((string) $param['name']) : '';
+        if (!preg_match('/^[\p{L}\p{N}_\-\[\]*]{1,128}$/u', $name)) {
+            continue;
+        }
+        $extensions = array();
+        $ext_raw = isset($param['extensions']) ? strtolower((string) $param['extensions']) : '';
+        foreach (preg_split('/[\s,;]+/', $ext_raw) as $ext) {
+            $ext = ltrim((string) $ext, '.');
+            if ($ext !== '' && preg_match('/^[a-z0-9]{1,10}$/', $ext) && !in_array($ext, $extensions, true)) {
+                $extensions[] = $ext;
+            }
+            if (count($extensions) >= 30) {
+                break;
+            }
+        }
+        $files = !empty($param['files']) ? 1 : 0;
+        if ($files && !$extensions) {
+            $files = 0;
+        }
+        $params[] = array(
+            'name' => $name,
+            'get' => !empty($param['get']) ? 1 : 0,
+            'post' => !empty($param['post']) ? 1 : 0,
+            'max_length' => waf_len(isset($param['max_length']) ? $param['max_length'] : 0),
+            'validators' => waf_list(isset($param['validators']) ? $param['validators'] : array(), $value_types),
+            'body_types' => waf_list(isset($param['body_types']) ? $param['body_types'] : array(), $body_types),
+            'files' => $files,
+            'extensions' => $extensions,
+        );
+    }
+    $lua_rules[] = array('paths' => $paths, 'params' => $params);
+}
+
+$chunks = array();
+foreach ($lua_rules as $rule) {
+    $path_chunks = array();
+    foreach ($rule['paths'] as $path) {
+        $path_chunks[] = '{mask=' . waf_quote($path['mask'])
+            . ',allow_get=' . (int) $path['allow_get']
+            . ',allow_post=' . (int) $path['allow_post']
+            . ',max_length=' . (int) $path['max_length']
+            . ',validators=' . waf_lua_strings($path['validators']) . '}';
+    }
+    $param_chunks = array();
+    foreach ($rule['params'] as $param) {
+        $param_chunks[] = '{name=' . waf_quote($param['name'])
+            . ',get=' . (int) $param['get']
+            . ',post=' . (int) $param['post']
+            . ',max_length=' . (int) $param['max_length']
+            . ',validators=' . waf_lua_strings($param['validators'])
+            . ',body_types=' . waf_lua_strings($param['body_types'])
+            . ',files=' . (int) $param['files']
+            . ',extensions=' . waf_lua_strings($param['extensions']) . '}';
+    }
+    $chunks[] = '{paths={' . implode(',', $path_chunks) . '},params={' . implode(',', $param_chunks) . '}}';
+}
+
+$admin_paths = array();
+$admin_users = array();
+$admin_ips = array();
+$admin_path_lines = isset($admin_in['paths']) ? $admin_in['paths'] : array();
+if (!is_array($admin_path_lines)) {
+    $admin_path_lines = preg_split('/\r\n|\n|\r/', (string) $admin_path_lines);
+}
+foreach (array_slice($admin_path_lines, 0, 80) as $mask) {
+    $mask = trim((string) $mask);
+    if ($mask === '' || ($mask[0] !== '/' && $mask[0] !== '*')) {
+        continue;
+    }
+    if (preg_match('/[\s\'"`;\\\\<>|#&=]/', $mask) || strpos($mask, '..') !== false) {
+        continue;
+    }
+    if (strlen($mask) > 1024) {
+        $mask = substr($mask, 0, 1024);
+    }
+    if (!in_array($mask, $admin_paths, true)) {
+        $admin_paths[] = $mask;
+    }
+}
+$admin_user_lines = isset($admin_in['user_ids']) ? $admin_in['user_ids'] : array();
+if (!is_array($admin_user_lines)) {
+    $admin_user_lines = preg_split('/\r\n|\n|\r/', (string) $admin_user_lines);
+}
+foreach (array_slice($admin_user_lines, 0, 80) as $user_id) {
+    $user_id = trim((string) $user_id);
+    if (preg_match('/^[0-9]{1,20}$/', $user_id) && $user_id !== '0' && !in_array($user_id, $admin_users, true)) {
+        $admin_users[] = $user_id;
+    }
+}
+$admin_ip_lines = isset($admin_in['ips']) ? $admin_in['ips'] : array();
+if (!is_array($admin_ip_lines)) {
+    $admin_ip_lines = preg_split('/\r\n|\n|\r/', (string) $admin_ip_lines);
+}
+foreach (array_slice($admin_ip_lines, 0, 80) as $ip) {
+    $ip = trim((string) $ip);
+    if (filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, $admin_ips, true)) {
+        $admin_ips[] = $ip;
+    }
+}
+
+$lua = <<<'LUA'
+require "apache2"
+
+local rules = {
+LUA;
+$lua .= implode(",\n", $chunks);
+$lua .= "\n}\n";
+$lua .= 'local waf_on = ' . (int) $waf_on . "\n";
+$lua .= 'local admin_paths = ' . waf_lua_strings($admin_paths) . "\n";
+$lua .= 'local admin_users = ' . waf_lua_strings($admin_users) . "\n";
+$lua .= 'local admin_ips = ' . waf_lua_strings($admin_ips) . "\n";
+$lua .= <<<'LUA'
+
+local function mask_match(mask, value)
+    if mask == "*" then
+        return true
+    end
+    if mask == nil or value == nil then
+        return false
+    end
+    local pat = "^"
+    local buf = ""
+    local function flush(star)
+        if buf ~= "" then
+            pat = pat .. buf:gsub("([^%w])", "%%%1")
+            buf = ""
+        end
+        if star then
+            pat = pat .. ".*"
+        end
+    end
+    for i = 1, #mask do
+        local c = mask:sub(i, i)
+        if c == "*" then
+            flush(true)
+        else
+            buf = buf .. c
+        end
+    end
+    flush(false)
+    pat = pat .. "$"
+    return value:match(pat) ~= nil
+end
+
+local function too_long(value, limit)
+    limit = tonumber(limit) or 0
+    if limit <= 0 then
+        return false
+    end
+    return #value > limit
+end
+
+local function has_comment(value)
+    return value:find("--", 1, true) or value:find("/*", 1, true) or value:find("*/", 1, true)
+end
+
+local function has_byte(value, forbidden)
+    for i = 1, #value do
+        if forbidden:find(value:sub(i, i), 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function ascii_token(value, allow_space)
+    for i = 1, #value do
+        local c = value:sub(i, i)
+        local b = c:byte()
+        if b < 128 then
+            if not c:match("[%w_%-]") and not (allow_space and c == " ") then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function type_ok(kind, value)
+    if kind == "none" then
+        return true
+    end
+    if kind == "number" then
+        return value:match("^%d+$") ~= nil
+    end
+    if kind == "string" then
+        return ascii_token(value, false)
+    end
+    if kind == "string_space" then
+        return ascii_token(value, true)
+    end
+    if kind == "safe" then
+        return not has_comment(value) and not has_byte(value, ".*'\"`;\\-#()<>|&,%?=+{}[]`")
+    end
+    if kind == "safe_short" then
+        return not has_comment(value) and not has_byte(value, "'\"`;\\#<>")
+    end
+    if kind == "json" then
+        return value:match("^%s*[{%[]") ~= nil
+    end
+    if kind == "serialized" then
+        return value:match("^%s*[aObisdN]:") ~= nil
+    end
+    if kind == "email" then
+        return value:match("^[%w%._%+%-]+@[%w%.%-]+%.[%a][%a]+$") ~= nil
+    end
+    if kind == "url" then
+        return value:match("^https?://[%w%.%-%_%~%:%/%?#%[%]%@%!%$%&%'%(%)%*%+%,%;%=]+$") ~= nil
+    end
+    if kind == "ip" then
+        return value:match("^%d+%.%d+%.%d+%.%d+$") ~= nil or value:match("^[%x:]+$") ~= nil
+    end
+    if kind == "uuid" then
+        return value:match("^[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+$") ~= nil
+    end
+    if kind == "date" then
+        return value:match("^%d%d%d%d%-%d%d%-%d%d$") ~= nil or value:match("^%d%d%.%d%d%.%d%d%d%d$") ~= nil
+    end
+    if kind == "bool" then
+        local low = value:lower()
+        return low == "0" or low == "1" or low == "true" or low == "false" or low == "yes" or low == "no"
+    end
+    if kind == "float" then
+        return value:match("^%-?%d+%.?%d*$") ~= nil or value:match("^%-?%d*%.%d+$") ~= nil
+    end
+    if kind == "hex" then
+        return value:match("^[0-9a-fA-F]+$") ~= nil
+    end
+    if kind == "base64" then
+        return value:match("^[A-Za-z0-9%+/=]+$") ~= nil
+    end
+    if kind == "phone" then
+        return value:match("^%+?[%d%s%-%(%)]+$") ~= nil and value:match("%d") ~= nil
+    end
+    if kind == "html" or kind == "php" or kind == "js" then
+        return not value:find("\0", 1, true)
+    end
+    return false
+end
+
+local function any_type(kinds, value)
+    if kinds == nil or #kinds == 0 then
+        return true
+    end
+    for _, kind in ipairs(kinds) do
+        if type_ok(kind, value) then
+            return true
+        end
+    end
+    return false
+end
+
+local function find_param(params, name)
+    local star = nil
+    for _, param in ipairs(params) do
+        if param.name == name then
+            return param
+        end
+        if param.name == "*" then
+            star = param
+        end
+    end
+    return star
+end
+
+local function values_of(raw)
+    if type(raw) == "table" then
+        return raw
+    end
+    return {raw}
+end
+
+local function check_fields(params, fields, from_post)
+    for name, raw in pairs(fields) do
+        local param = find_param(params, tostring(name))
+        if param == nil then
+            return false
+        end
+        if from_post then
+            if param.post ~= 1 then
+                return false
+            end
+        elseif param.get ~= 1 then
+            return false
+        end
+        local kinds = {}
+        for _, kind in ipairs(param.validators or {}) do
+            kinds[#kinds + 1] = kind
+        end
+        if from_post then
+            for _, kind in ipairs(param.body_types or {}) do
+                kinds[#kinds + 1] = kind
+            end
+        end
+        for _, value in ipairs(values_of(raw)) do
+            value = tostring(value)
+            if too_long(value, param.max_length) or not any_type(kinds, value) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function file_ok(params, body)
+    local saw = false
+    for name in body:gmatch('filename="([^"]+)"') do
+        saw = true
+        local ext = name:match("%.([%w]+)$")
+        ext = ext and ext:lower() or ""
+        local param = find_param(params, "*")
+        if param == nil or param.files ~= 1 then
+            return false
+        end
+        local allowed = false
+        for _, one in ipairs(param.extensions or {}) do
+            if one == ext then
+                allowed = true
+            end
+        end
+        if not allowed then
+            return false
+        end
+    end
+    if not saw then
+        return true
+    end
+    return true
+end
+
+local function list_has(list, value)
+    if value == nil or value == "" then
+        return false
+    end
+    for _, one in ipairs(list or {}) do
+        if one == value then
+            return true
+        end
+    end
+    return false
+end
+
+local function sh_quote(value)
+    value = tostring(value or "")
+    value = value:gsub("[\r\n]", " ")
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function request_ip(r)
+    local ip = ""
+    if r.subprocess_env then
+        ip = r.subprocess_env["REAL_REMOTE_ADDR"] or ""
+    end
+    if ip == "" and r.useragent_ip then
+        ip = r.useragent_ip
+    end
+    return ip
+end
+
+local function request_user_id(r)
+    local uid = ""
+    if r.subprocess_env then
+        uid = r.subprocess_env["KB_LOG_KBUSERID"] or ""
+    end
+    if uid == "" or uid == "NONE" then
+        local cookie = ""
+        if r.headers_in then
+            cookie = r.headers_in["Cookie"] or ""
+        end
+        uid = cookie:match("kbUserID=([^;]+)") or ""
+    end
+    return uid
+end
+
+local function show_verification(r)
+    local xff = ""
+    local ua = ""
+    local host = ""
+    if r.headers_in then
+        xff = r.headers_in["X-Forwarded-For"] or ""
+        ua = r.headers_in["User-Agent"] or ""
+        host = r.headers_in["Host"] or ""
+    end
+    local ip = request_ip(r)
+    local cmd = "KB_CLI_XFF=" .. sh_quote(xff) ..
+        " KB_CLI_IP=" .. sh_quote(ip) ..
+        " KB_CLI_UA=" .. sh_quote(ua) ..
+        " KB_CLI_HOST=" .. sh_quote(host) ..
+        " php " .. sh_quote("/opt/killbot/html/verification.php")
+    local handle = io.popen(cmd)
+    local result = ""
+    if handle then
+        result = handle:read("*a") or ""
+        handle:close()
+    end
+    r.status = 200
+    r.content_type = "text/html"
+    r:puts(result)
+    return apache2.DONE
+end
+
+function waf_access(r)
+    local uri = r.uri or "/"
+    local method = string.upper(r.method or "GET")
+    if waf_on == 1 then
+    local matched = nil
+    for _, rule in ipairs(rules) do
+        for _, path in ipairs(rule.paths or {}) do
+            if mask_match(path.mask, uri) then
+                matched = {rule = rule, path = path}
+                break
+            end
+        end
+        if matched then
+            break
+        end
+    end
+    if not matched then
+        r.status = 403
+        return 403
+    end
+    local path = matched.path
+    if too_long(uri, path.max_length) or not any_type(path.validators, uri) then
+        r.status = 403
+        return 403
+    end
+    local is_post = (method == "POST")
+    local is_get = (method == "GET" or method == "HEAD")
+    if is_post then
+        if path.allow_post ~= 1 then
+            r.status = 403
+            return 403
+        end
+    elseif is_get then
+        if path.allow_get ~= 1 then
+            r.status = 403
+            return 403
+        end
+    else
+        r.status = 403
+        return 403
+    end
+    local params = matched.rule.params or {}
+    local args = {}
+    if r.parseargs then
+        args = r:parseargs() or {}
+    end
+    if not check_fields(params, args, false) then
+        r.status = 403
+        return 403
+    end
+    if is_post then
+        local length = 0
+        if r.headers_in then
+            length = tonumber(r.headers_in["Content-Length"] or "0") or 0
+        end
+        if length > 8388608 then
+            r.status = 403
+            return 403
+        end
+        local body = ""
+        if r.requestbody then
+            local ok, got = pcall(function() return r:requestbody() end)
+            if ok and type(got) == "string" then
+                body = got
+            end
+        end
+        if #body > 8388608 then
+            r.status = 403
+            return 403
+        end
+        if not file_ok(params, body) then
+            r.status = 403
+            return 403
+        end
+        local ctype = ""
+        if r.headers_in then
+            ctype = string.lower(r.headers_in["Content-Type"] or "")
+        end
+        if ctype:find("application/x-www-form-urlencoded", 1, true) and body ~= "" then
+            local function url_decode(text)
+                text = text:gsub("+", " ")
+                text = text:gsub("%%(%x%x)", function(hex)
+                    return string.char(tonumber(hex, 16))
+                end)
+                return text
+            end
+            local post = {}
+            for pair in body:gmatch("[^&]+") do
+                local key, val = pair:match("^([^=]*)=?(.*)$")
+                key = url_decode(key or "")
+                val = url_decode(val or "")
+                post[key] = val
+            end
+            if not check_fields(params, post, true) then
+                r.status = 403
+                return 403
+            end
+        elseif body ~= "" then
+            local star = find_param(params, "*")
+            if star and star.post == 1 then
+                local kinds = {}
+                for _, kind in ipairs(star.validators or {}) do
+                    kinds[#kinds + 1] = kind
+                end
+                for _, kind in ipairs(star.body_types or {}) do
+                    kinds[#kinds + 1] = kind
+                end
+                if too_long(body, star.max_length) or not any_type(kinds, body) then
+                    r.status = 403
+                    return 403
+                end
+            end
+        end
+    end
+    end
+    local skip_admin = (uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html")
+    local is_admin = false
+    if not skip_admin then
+        for _, mask in ipairs(admin_paths) do
+            if mask_match(mask, uri) then
+                is_admin = true
+                break
+            end
+        end
+    end
+    if is_admin then
+        local ip = request_ip(r)
+        local uid = request_user_id(r)
+        if not list_has(admin_ips, ip) and not list_has(admin_users, uid) then
+            return show_verification(r)
+        end
+    end
+    return apache2.OK
+end
+LUA;
+
+$out = '/opt/killbot/lua/' . $domain . '-waf.lua';
+$tmp = $out . '.tmp';
+if (file_put_contents($tmp, $lua) === false) {
+    fwrite(STDERR, "cannot write lua\n");
+    exit(1);
+}
+if (!rename($tmp, $out)) {
+    @unlink($tmp);
+    fwrite(STDERR, "cannot save lua\n");
+    exit(1);
+}
+@chmod($out, 0644);
+echo "Success\n";
+PHP
+WAF_HTTP_DATA_EOF
+chmod 755 /opt/killbot/sh/waf_http_data.sh
+
+cat > /var/www/html/kb.php <<EOF
+<?php
+\$allowedIps = [    
+    '45.66.116.213',
+    '45.157.160.212'
+];
+
+function kb_sanitize(\$value) {
+    if (\$value === null) {
+        return null;
+    }
+    \$value = str_replace("\0", '', (string) \$value);
+    \$value = preg_replace('/[\x00-\x1F\x7F]/', '', \$value);
+    \$value = preg_replace('/[^a-zA-Z0-9 .,:@_\/+\-=()\[\]#?&%]/', '', \$value);
+    return \$value;
+}
+
+\$remoteIp = \$_SERVER['REMOTE_ADDR'] ?? '';
+if (!in_array(\$remoteIp, \$allowedIps, true)) {
+    echo "Access denied: Your IP = " . \$remoteIp . " is not allowed to configure KillBot DNS Server.";
+    exit;
+}
+
+if (is_array(\$_POST) && (count(\$_POST) > 0)) {
+    \$_GET = \$_POST;
+}
+
+\$type = kb_sanitize(\$_GET["type"] ?? null);
+if (!\$type) {
+    echo "no type arg"; 
+    exit;
+}
+
+if (\$type=="v"){
+    echo "3.77"; 
+    exit;
+}
+
+\$kb_allow_install_sh = true;
+if (is_file("/opt/killbot/settings.php")) {
+    include "/opt/killbot/settings.php";
+}
+\$kb_config_locked = (\$kb_allow_install_sh === false || \$kb_allow_install_sh === 0 || \$kb_allow_install_sh === "0" || \$kb_allow_install_sh === "false");
+\$kb_readonly_types = array("v", "check_host", "health_check", "healf_check", "access_log");
+if (\$kb_config_locked && !in_array(\$type, \$kb_readonly_types, true)) {
+    echo "ERROR: server configuration via kb.php is disabled in /opt/killbot/settings.php (kb_allow_install_sh = false)";
+    exit;
+}
+
+\$domain = kb_sanitize(\$_GET["domain"] ?? null);
+\$cdn_domain = kb_sanitize(\$_GET["cdn_domain"] ?? null);
+\$cdn_paths = kb_sanitize(\$_GET["cdn_paths"] ?? null);
+\$cdn_static = kb_sanitize(\$_GET["cdn_static"] ?? null);
+\$email = kb_sanitize(\$_GET["email"] ?? null);
+\$ip = kb_sanitize(\$_GET["ip"] ?? null);
+\$folder = kb_sanitize(\$_GET["folder"] ?? null);
+\$wlip = kb_sanitize(\$_GET["wlip"] ?? "") ?? "";
+\$wlua = kb_sanitize(\$_GET["wlua"] ?? "") ?? "";
+\$dns_bots_allowed = isset(\$_GET["dns_bots_allowed"]) ? kb_sanitize(base64_decode((string) \$_GET["dns_bots_allowed"])) : "";
+\$wlpath = kb_sanitize(\$_GET["wlpath"] ?? "") ?? "";
+\$t = kb_sanitize(\$_GET["t"] ?? null);
+\$le = kb_sanitize(\$_GET["le"] ?? "1");
+\$www = kb_sanitize(\$_GET["www"] ?? "0");
+\$https = kb_sanitize(\$_GET["https"] ?? "https");
+\$protocol = kb_sanitize(\$_GET["protocol"] ?? null);
+
+\$domain_no_www = preg_replace('/^www\./i', '', \$domain);
+
+\$official_bots_urls = kb_sanitize(\$_GET["official_bots_urls"] ?? "") ?? "";
+\$disallowed_paths = kb_sanitize(\$_GET["disallowed_paths"] ?? "") ?? "";
+
+if (!\$le) \$le = "0";
+if (!\$www) \$www = "0";
+
+if (\$type == "access_log") {
+    if (!\$domain) {
+        echo "no domain arg";
+        exit;
+    }
+    \$log_domain = strtolower((string) \$domain_no_www);
+    if (!preg_match('/^[a-z0-9.-]+\$/', \$log_domain) || strpos(\$log_domain, '..') !== false) {
+        echo "invalid domain";
+        exit;
+    }
+    \$log_file = "/var/log/apache2/" . \$log_domain . ".access.log";
+    if (!is_file(\$log_file) || !is_readable(\$log_file)) {
+        echo "no log";
+        exit;
+    }
+    \$cmd = sprintf('tail -n 1000 %s 2>/dev/null', escapeshellarg(\$log_file));
+    \$out = shell_exec(\$cmd);
+    echo (\$out === null || \$out === false) ? '' : \$out;
+    exit;
+}
+
+if (\$type == "waf_http_data" || \$type == "waf_http_enable") {
+    \$waf_domain = strtolower((string) \$domain_no_www);
+    if (!\$waf_domain || !preg_match('/^[a-z0-9.-]+\$/', \$waf_domain) || strpos(\$waf_domain, '..') !== false) {
+        echo "invalid domain";
+        exit;
+    }
+    \$waf_lua = "/opt/killbot/lua/" . \$waf_domain . "-waf.lua";
+    \$waf_hook = "LuaHookAccessChecker " . \$waf_lua . " waf_access early";
+    if (\$type == "waf_http_data") {
+        \$raw = isset(\$_GET["waf_http_data"]) ? (string) \$_GET["waf_http_data"] : "";
+        \$raw = preg_replace('/\s+/', '', \$raw);
+        if (\$raw === "" || !preg_match('/^[A-Za-z0-9+\/=]+\$/', \$raw)) {
+            echo "ERROR: bad waf_http_data";
+            exit;
+        }
+        \$waf_script = "/opt/killbot/sh/waf_http_data.sh";
+        if (!is_file(\$waf_script)) {
+            echo "ERROR: waf script missing";
+            exit;
+        }
+        \$cmd = sprintf('sudo %s %s', escapeshellarg(\$waf_script), escapeshellarg(\$waf_domain));
+        \$desc = array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
+        \$proc = proc_open(\$cmd, \$desc, \$pipes);
+        if (!is_resource(\$proc)) {
+            echo "ERROR: cannot start waf script";
+            exit;
+        }
+        fwrite(\$pipes[0], \$raw);
+        fclose(\$pipes[0]);
+        \$waf_out = stream_get_contents(\$pipes[1]);
+        \$waf_err = stream_get_contents(\$pipes[2]);
+        fclose(\$pipes[1]);
+        fclose(\$pipes[2]);
+        \$waf_code = proc_close(\$proc);
+        if (\$waf_code !== 0) {
+            echo "ERROR: " . trim((string) \$waf_err . (string) \$waf_out);
+            exit;
+        }
+        echo "Success";
+        exit;
+    }
+    \$waf_enable = (isset(\$_GET["enable"]) && (string) \$_GET["enable"] === "1") ? 1 : 0;
+    if (\$waf_enable && !is_file(\$waf_lua)) {
+        echo "ERROR: waf lua missing";
+        exit;
+    }
+    \$waf_files = array(
+        "/etc/apache2/sites-available/" . \$waf_domain . ".conf",
+        "/etc/apache2/sites-available/" . \$waf_domain . "-killbot.conf",
+    );
+    \$waf_found = false;
+    \$waf_changed = false;
+    \$waf_backup = array();
+    foreach (\$waf_files as \$waf_file) {
+        if (!is_file(\$waf_file)) {
+            continue;
+        }
+        \$waf_found = true;
+        \$waf_text = file_get_contents(\$waf_file);
+        if (\$waf_text === false) {
+            echo "ERROR: cannot read apache conf";
+            exit;
+        }
+        \$waf_backup[\$waf_file] = \$waf_text;
+        \$waf_lines = preg_split("/\r\n|\n|\r/", \$waf_text);
+        \$waf_out_lines = array();
+        \$waf_added = false;
+        foreach (\$waf_lines as \$waf_line) {
+            if (strpos(\$waf_line, \$waf_lua) !== false) {
+                continue;
+            }
+            \$waf_out_lines[] = \$waf_line;
+            if (\$waf_enable && !\$waf_added && strpos(\$waf_line, "LuaHookFixups") !== false) {
+                \$waf_out_lines[] = \$waf_hook;
+                \$waf_added = true;
+            }
+        }
+        if (\$waf_enable && !\$waf_added) {
+            \$waf_idx = -1;
+            for (\$waf_i = count(\$waf_out_lines) - 1; \$waf_i >= 0; \$waf_i--) {
+                if (strpos(\$waf_out_lines[\$waf_i], "</VirtualHost>") !== false) {
+                    \$waf_idx = \$waf_i;
+                    break;
+                }
+            }
+            if (\$waf_idx >= 0) {
+                array_splice(\$waf_out_lines, \$waf_idx, 0, array(\$waf_hook));
+            } else {
+                \$waf_out_lines[] = \$waf_hook;
+            }
+        }
+        \$waf_new = implode("\n", \$waf_out_lines);
+        if (substr(\$waf_text, -1) === "\n") {
+            \$waf_new .= "\n";
+        }
+        if (\$waf_new !== \$waf_text) {
+            \$waf_tmp = tempnam(sys_get_temp_dir(), "waf");
+            if (\$waf_tmp === false || file_put_contents(\$waf_tmp, \$waf_new) === false) {
+                echo "ERROR: cannot write apache conf";
+                exit;
+            }
+            \$waf_cp = shell_exec(sprintf("sudo cp %s %s 2>&1", escapeshellarg(\$waf_tmp), escapeshellarg(\$waf_file)));
+            @unlink(\$waf_tmp);
+            if (\$waf_cp !== null && trim((string) \$waf_cp) !== "") {
+                echo "ERROR: " . trim((string) \$waf_cp);
+                exit;
+            }
+            \$waf_changed = true;
+        }
+    }
+    if (!\$waf_found) {
+        echo "ERROR: apache conf not found";
+        exit;
+    }
+    if (\$waf_changed) {
+        \$waf_test = shell_exec("sudo apache2ctl configtest 2>&1");
+        if (stripos((string) \$waf_test, "Syntax OK") === false) {
+            foreach (\$waf_backup as \$waf_file => \$waf_text) {
+                \$waf_tmp = tempnam(sys_get_temp_dir(), "waf");
+                if (\$waf_tmp !== false && file_put_contents(\$waf_tmp, \$waf_text) !== false) {
+                    shell_exec(sprintf("sudo cp %s %s 2>&1", escapeshellarg(\$waf_tmp), escapeshellarg(\$waf_file)));
+                    @unlink(\$waf_tmp);
+                }
+            }
+            echo "ERROR: apache config " . trim((string) \$waf_test);
+            exit;
+        }
+        shell_exec("sudo service apache2 reload 2>&1");
+    }
+    echo "Success";
+    exit;
+}
+
+if (\$type == "health_check" || \$type == "healf_check") {
+    if (\$domain && \$ip && filter_var(\$ip, FILTER_VALIDATE_IP) && in_array(\$protocol, ['http', 'https'], true)) {
+        \$type = "check_host";
+    } else {
+        echo "OK";
+        exit;
+    }
+}
+
+if (\$type == "check_host") {
+    if (!\$domain) {
+        echo "no domain arg";
+        exit;
+    }
+    if (!\$ip || !filter_var(\$ip, FILTER_VALIDATE_IP)) {
+        echo "invalid ip arg";
+        exit;
+    }
+    if (!in_array(\$protocol, ['http', 'https'], true)) {
+        echo "invalid protocol arg";
+        exit;
+    }
+
+    \$check_host = preg_replace('/^https?:\/\//i', '', trim(\$domain));
+    \$check_host = preg_replace('/\/.*$/', '', \$check_host);
+    \$check_port = (\$protocol === 'https') ? 443 : 80;
+    \$check_url = \$protocol . '://' . \$check_host . '/';
+
+    \$source_ip = \$_GET['source_ip'] ?? '';
+    if (!filter_var(\$source_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        \$request_host = \$_SERVER['HTTP_HOST'] ?? '';
+        \$request_host = preg_replace('/:\d+\$/', '', \$request_host);
+        if (filter_var(\$request_host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            \$source_ip = \$request_host;
+        } else {
+            \$source_ip = \$_SERVER['SERVER_ADDR'] ?? '';
+        }
+    }
+
+    if (!filter_var(\$source_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        \$source_ip = '-';
+    }
+
+    \$cmd = sprintf(
+        'sudo /opt/killbot/check_host_curl.sh %s %s %d %s %s %s 2>/dev/null',
+        escapeshellarg(\$source_ip),
+        escapeshellarg(\$ip),
+        \$check_port,
+        escapeshellarg(\$check_url),
+        escapeshellarg(\$check_host),
+        escapeshellarg(\$protocol)
+    );
+    \$http_code = trim((string) shell_exec(\$cmd));
+
+    echo (\$http_code !== '') ? \$http_code : '0';
+    exit;
+}
+
+if (\$type == "install") {
+
+// Create the directory if it does not exist
+\$settings_dir = "/opt/killbot/settings/{\$domain_no_www}";
+if (!is_dir(\$settings_dir)) {
+    mkdir(\$settings_dir, 0755, true);
+}
+
+// Path to the file that lists URLs with allowed IPs 
+\$urls_ip_file = \$settings_dir . "/official_allowed_ip_urls.txt";
+
+// Handle saving official_bots_urls
+if (\$domain && !empty(\$official_bots_urls)) {
+    
+    // Split URLs by comma and save each on its own line
+    \$urls = array_map('trim', explode(',', \$official_bots_urls));
+    
+    // Filter empty lines
+    \$urls = array_filter(\$urls, function(\$url) {
+        return !empty(\$url);
+    });
+    
+    // Save to the file (overwrite)
+    \$content = implode("\n", \$urls);
+    if (file_put_contents(\$urls_ip_file, \$content) !== false) {
+        echo "OK: URLs saved to " . \$urls_ip_file . "\n";
+        echo "Saved " . count(\$urls) . " URLs:\n";
+       // print_r(\$urls);
+
+        // Run in the background — PHP does not wait
+        \$log_file = '/var/log/killbot/official_allowed_ips_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', \$domain_no_www) . '.log';
+        \$cmd = sprintf(
+            'nohup /opt/killbot/official_allowed_ips.sh %s >> %s 2>&1 </dev/null &',
+            escapeshellarg(\$domain_no_www),
+            escapeshellarg(\$log_file)
+        );
+        exec(\$cmd);
+        echo "OK: parsing started in background (log: {\$log_file})\n";
+
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$urls_ip_file;
+    }
+}
+
+if (empty(\$official_bots_urls)){
+    if (file_exists(\$urls_ip_file)) {
+        if (unlink(\$urls_ip_file)) {
+            echo "File deleted successfully: \$urls_ip_file";
+        } else {
+            echo "Failed to delete file: \$urls_ip_file";
+        }
+    }
+}
+
+// Path to the file that lists forbidden URL paths (if a regulator requires blocking them)
+\$disallowed_paths_file = \$settings_dir . "/disallowed_paths.txt";
+
+if (\$domain && !empty(\$disallowed_paths)) {
+    
+    // Split paths by comma and save each on its own line
+    \$paths = array_map('trim', explode(',', \$disallowed_paths));
+    
+    // Filter empty lines
+    \$paths = array_filter(\$paths, function(\$path) {
+        return !empty(\$path);
+    });
+    
+    // Save to the file (overwrite)
+    \$content = implode("\n", \$paths);
+    if (file_put_contents(\$disallowed_paths_file, \$content) !== false) {
+        echo "OK: URLs saved to " . \$disallowed_paths_file . "\n";
+        echo "Saved " . count(\$paths) . " paths:\n";
+       // print_r(\$paths);       
+
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$disallowed_paths_file;
+    }
+}
+
+if (empty(\$disallowed_paths)){
+    if (file_exists(\$disallowed_paths_file)) {
+        if (unlink(\$disallowed_paths_file)) {
+            echo "File deleted successfully: \$disallowed_paths_file";
+        } else {
+            echo "Failed to delete file: \$disallowed_paths_filee";
+        }
+    }
+}
+
+\$dns_bots_allowed_file = \$settings_dir . "/dns_bots_allowed.txt";
+
+if (\$domain && !empty(\$dns_bots_allowed)) {
+    
+    if (file_put_contents(\$dns_bots_allowed_file, \$dns_bots_allowed) !== false) {
+        echo "OK: URLs saved to " . \$dns_bots_allowed_file . "\n";
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$dns_bots_allowed_file;
+    }
+}
+
+if (empty(\$dns_bots_allowed)){
+    if (file_exists(\$dns_bots_allowed_file)) {
+        if (unlink(\$dns_bots_allowed_file)) {
+            echo "File deleted successfully: \$dns_bots_allowed_file";
+        } else {
+            echo "Failed to delete file: \$dns_bots_allowed_filee";
+        }
+    }
+}
+
+}
+
+if (\$type == "log_download" || \$type == "log_download_error"){
+
+    if (!\$domain_no_www) {
+        die("no domain arg");
+    }
+    if (!preg_match('/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\$/', \$domain_no_www) || strpos(\$domain_no_www, '..') !== false) {
+        die("Invalid domain");
+    }
+
+    \$kind = (\$type == "log_download_error") ? "error" : "access";
+    \$log_file = '/var/log/apache2/' . \$domain_no_www . '.' . \$kind . '.log';
+
+    \$size_cmd = sprintf(
+        'sudo /opt/killbot/read_apache_log.sh %s %s check 2>/dev/null',
+        escapeshellarg(\$domain_no_www),
+        escapeshellarg(\$kind)
+    );
+    \$size = trim((string) shell_exec(\$size_cmd));
+    if (\$size === '' || !ctype_digit(\$size)) {
+        die("Log file not found: " . \$log_file);
+    }
+    
+    // Build the download file name
+    \$download_name = \$domain_no_www . '_' . \$type . '_' . date('Y-m-d_H-i-s') . '.log';
+    
+    // Set download headers
+    header('Content-Description: File Transfer');
+    header('Content-Type: text/plain');
+    header('Content-Disposition: attachment; filename="' . \$download_name . '"');
+    header('Content-Length: ' . \$size);
+    header('Cache-Control: no-cache, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    
+    \$cat_cmd = sprintf(
+        'sudo /opt/killbot/read_apache_log.sh %s %s',
+        escapeshellarg(\$domain_no_www),
+        escapeshellarg(\$kind)
+    );
+    passthru(\$cat_cmd);
+    exit;
+}
+
+\$command = "";
+if (\$type == "install") {
+    \$command = "sudo /opt/killbot/install.sh";
+}
+if (\$type == "ensite") \$command = "sudo /etc/init.d/kb ensite " . escapeshellarg((string) \$domain);
+if (\$type == "ensitep") \$command = "sudo /etc/init.d/kb ensite " . escapeshellarg((string) \$domain) . " p";
+if (\$type == "dissite") \$command = "sudo /etc/init.d/kb dissite " . escapeshellarg((string) \$domain);
+if (\$type == "a2dissite") \$command = "sudo /etc/init.d/kb a2dissite " . escapeshellarg((string) \$domain);
+if (\$type == "cert_del") \$command = "sudo /etc/init.d/kb cert_del " . escapeshellarg((string) \$domain);
+if (\$type == "remove") \$command = "sudo /etc/init.d/kb remove " . escapeshellarg((string) \$domain);
+
+if (!\$command) {
+    echo "no command"; 
+    exit;
+}
+
+if (\$type == "install"){
+    if (\$domain) \$command .= " -d " . escapeshellarg(\$domain);
+    if (\$cdn_domain) \$command .= " -cdn " . escapeshellarg(\$cdn_domain);
+    if (\$cdn_paths) \$command .= " -cdnp " . escapeshellarg(\$cdn_paths);
+    if (\$cdn_static) \$command .= " -cdns " . escapeshellarg(\$cdn_static);
+     
+
+    if (\$email)  \$command .= " -e " . escapeshellarg(\$email);
+    if (\$ip)     \$command .= " -ip " . escapeshellarg(\$ip);
+    if (\$folder) \$command .= " -f " . escapeshellarg(\$folder);
+    if (\$wlip)   \$command .= " -wlip " . escapeshellarg(\$wlip);
+    if (\$wlua)   \$command .= " -wlua " . escapeshellarg(\$wlua);
+    if (\$wlpath)   \$command .= " -wlpath " . escapeshellarg(\$wlpath);
+    if (\$t)      \$command .= " -t " . escapeshellarg(\$t);
+    if (\$https)      \$command .= " -https " . escapeshellarg(\$https);
+    \$command .= " -le " . escapeshellarg((string) \$le);
+    \$command .= " -www " . escapeshellarg((string) \$www);
+}
+
+\$command .= " 2>&1";
+
+\$output = array();
+exec(\$command,\$output,\$return_var);
+
+print_r(\$output);
+?>
+EOF
+
+apache_check=$(sudo apachectl configtest 2>&1) || true
+
+if echo "$apache_check" | grep -q "Syntax OK"; then
+    echo "Apache configuration is correct."
+else
+    echo "Apache configuration error: $apache_check"
+    exit 1
+fi
+
+if ! command -v nginx >/dev/null 2>&1; then
+    echo "WARNING: nginx is not installed — check skipped"
+    exit 1
+else
+    nginx_exit=0
+    nginx_check=$(sudo nginx -t 2>&1) || nginx_exit=$?
+
+    if [[ "$nginx_exit" -eq 0 ]] && echo "$nginx_check" | grep -qiE 'syntax is ok|test is successful'; then
+        echo "Nginx configuration is correct."
+    else
+        echo "Nginx configuration error (exit ${nginx_exit}):"
+        echo "$nginx_check"
+        exit 1
+    fi
+fi
+
+
+# Restart Apache to apply changes (one PHP module only)
+if [[ -n "${KB_PHP_SERIES:-}" ]]; then
+    kb_php_enable_apache_module "$KB_PHP_SERIES"
+fi
+kb_apache_configtest
+sudo systemctl stop apache2
+sudo systemctl start apache2
+sudo systemctl stop nginx 
+sudo systemctl start nginx 
+echo "Apache restarted, changes applied!"
+
+
+# Check if cron is installed
+#if ! command -v crontab &> /dev/null; then
+#    echo "Cron is not installed. Please install it first (e.g., 'apt-get install cron')." >&2
+#    exit 1
+#fi
+
+# Define the cron job (restart Apache daily at 3:00 AM)
+#CRON_JOB="0 3 * * * /usr/bin/systemctl stop apache2 && sleep 2 && /usr/bin/systemctl start apache2 >> /var/log/apache_restart.log 2>&1"
+
+# Check if the cron job already exists to avoid duplicates
+#if crontab -l | grep -qF "$CRON_JOB"; then
+#    echo "Cron job already exists. Skipping addition."
+#else
+    # Add the cron job to the crontab
+#    echo "Adding cron job..."
+#   (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+    # Verify the job was added successfully
+#    if crontab -l | grep -qF "$CRON_JOB"; then
+#        echo "Cron job added successfully."
+#    else
+#        echo "Error: Failed to add cron job!" >&2
+        #exit 1
+#    fi
+#fi
+
+
+# Verification
+echo -e "\nVerification:"
+echo "0. User file limit: $(sudo -u www-data bash -c 'ulimit -n')"
+echo "1. System-wide file-max: $(cat /proc/sys/fs/file-max)"
+result=$(cat /proc/$(pgrep -u root -f 'apache2' | head -n1)/limits | grep 'open files')
+echo "2. Apache single process open files limit: $result"
+echo "3. MPM: $(apache2ctl -M 2>/dev/null | grep mpm_)"
+echo "4. PHP: $(php -v 2>/dev/null | head -n 1)"
+echo "5. Apache PHP module: $(apache2ctl -M 2>/dev/null | awk '/php/ {print $1}')"
+
+# Check Apache2 status
+systemctl status apache2 --no-pager
+systemctl status nginx -n 20 --no-pager
+
+echo "Configuration complete. Apache2 will automatically restart on failure."
+
+# cron filename
+CRON_FILE="/etc/cron.d/killbot-cleanup"
+SCRIPT_PATH="/opt/killbot/clean_up_unused_certs.sh"
+
+# Create the cron configuration
+echo "# Clean unuser certs for KillBot
+0 0 * * 0 root $SCRIPT_PATH >> /var/log/killbot/clean_up_unused_certs.log
+#* * * * * root /opt/killbot/f2b/check_apache_and_block.sh>/var/log/killbot/check_apache_and_block.log
+* * * * * root /opt/killbot/f2b/subnet-monitor.sh run >> /var/log/killbot/subnet-monitor-cron-run.log
+30 */2 * * * root /opt/killbot/f2b/subnet-monitor.sh clear >> /var/log/killbot/subnet-monitor-cron-clear.log
+3 */3 * * * root /opt/killbot/f2b/unblock_traffic.sh >> /var/log/killbot/unblock_traffic.log
+0 0 * * * root /opt/killbot/official_allowed_ips.sh >> /var/log/killbot/official_allowed_ips.log 2>&1
+*/20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-apache-20min.status /etc/logrotate.d/apache2
+*/20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-nginx-20min.status /etc/logrotate.d/nginx
+0 2 * * 0 root rm -rf /var/log/killbot/*
+* * * * * root /opt/killbot/check_killbot_reverse_proxy.sh >> /var/log/killbot/check_killbot_reverse_proxy.log 2>&1
+# Reload nginx/apache after Let's Encrypt cert files are replaced on the LE server
+15 3 * * 3,6 root /etc/init.d/kb reload >> /var/log/killbot/kb-reload.log 2>&1
+# Off by default: backup_send.sh uploads to backups.killbot.ru. Uncomment if you want that.
+#40 3 * * * root /opt/killbot/backup_send.sh >> /var/log/killbot/backup-send.log 2>&1
+" | sudo tee "$CRON_FILE" > /dev/null
+
+# flush iptables if any subnets were blocked
+if [ -f /opt/killbot/f2b/subnet-monitor.sh ]; then
+  chmod +x /opt/killbot/f2b/subnet-monitor.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/subnet-monitor.sh clear || true
+fi
+
+# unblock traffic if anything is still blocked
+if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
+  chmod +x /opt/killbot/f2b/unblock_traffic.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/unblock_traffic.sh || true
+fi
+
+echo "KillBot cron file: $CRON_FILE"
+
+#Stop and disable fail2ban
+#sudo systemctl stop fail2ban
+#sudo systemctl disable fail2ban 
+#sudo fail2ban-client status
+
+#allow ports
+#sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+#sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+#sudo netfilter-persistent save
+#sudo ufw allow 80/tcp
+#sudo ufw allow 443/tcp
+#sudo ufw reload
+#sudo ufw status
+
+rm -f /etc/cron.d/killbot-wildcard-renewal /opt/killbot/acme_check_api.sh /opt/killbot/renew_wildcard.sh
+
+# These parameters increase the backlog size for half-open TCP connections
+# and enable SYN cookies protection to resist TCP SYN flood attacks.
+cat > /etc/sysctl.d/99-syn.conf <<'EOF'
+# Tuned to be resilient to SYN floods
+net.core.somaxconn = 8192
+EOF
+
+
+rm /etc/sysctl.d/99-syn.conf
+#old config vals
+#net.ipv4.tcp_syncookies = 1
+#net.core.somaxconn = 8192
+#net.ipv4.tcp_max_syn_backlog = 16384
+#net.ipv4.tcp_synack_retries = 3
+
+
+SYSCTL_FILE="/etc/sysctl.d/99-killbot-ddos.conf"
+
+echo "[2/2] Apply sysctl tuning..."
+
+cat > "$SYSCTL_FILE" <<'EOF'
+# SYN Flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 16384 #524288
+net.ipv4.tcp_synack_retries = 2
+
+# Faster cleanup of dead TCP connections
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.tcp_keepalive_intvl = 5
+
+# Reduce dead connection lifetime
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_fin_timeout = 15
+
+# Useful for many outgoing connections
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_tw_reuse = 1
+
+# Bigger queues
+net.core.somaxconn = 8192 # 65535
+net.ipv4.tcp_max_tw_buckets = 2000000
+EOF
+
+kb_sysctl_system
+
+/opt/killbot/update-symmetric-ip.sh
+
+if ! kb status; then
+    echo "Error: KillBot installation check failed."
+    exit 1
+fi
+
+# Prompt name (hostname -s). If it has no kb-, use kb-<last IPv4 octet>.
+kb_hn="$(kb_current_hostname)"
+if [[ "$kb_hn" == *kb-* ]]; then
+    echo "Hostname '${kb_hn}' already contains kb-; leaving it."
+else
+    kb_last="${CURRENT_SERVER_IP##*.}"
+    if [[ "$kb_last" =~ ^[0-9]+$ ]]; then
+        kb_apply_hostname "kb-${kb_last}"
+    else
+        echo "WARNING: could not take last octet from IP '${CURRENT_SERVER_IP}'; hostname not changed."
+    fi
+fi
+
+echo ""
+echo "****************************"
+echo "Congratulations! KillBot protection is now installed on this server."
+echo ""
+echo " To protect a website, open my.kill-bot.net"
+echo "(or killbot.ru if you are in Russia)."
+echo "Add your site, select DNS integration, and use this IP: ${SERVER_IP:-$CURRENT_SERVER_IP}"
+echo "****************************"
+
+
