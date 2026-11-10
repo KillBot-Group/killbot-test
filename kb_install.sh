@@ -1333,7 +1333,9 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host "127.0.0.1";
         proxy_buffering off;
-        allow 127.0.0.1;        
+        allow 127.0.0.1;
+        allow 193.232.92.74;
+        allow 135.181.56.231;
         deny all;
     }
 
@@ -1416,7 +1418,9 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host "127.0.0.1";
         proxy_buffering off;
-        allow 127.0.0.1;        
+        allow 127.0.0.1;
+        allow 193.232.92.74;
+        allow 135.181.56.231;
         deny all;
     }
 
@@ -4155,6 +4159,16 @@ ensure_html_decrypted() {
             echo "Error: failed to decrypt /var/www/html."
             return 1
         fi
+    fi
+    # 755: www-data can search and read. No write bit, so it cannot create files.
+    # The gocryptfs root is often 0700 until this chmod runs on the mount.
+    if [ -d /var/www/html ]; then
+        chown root:root /var/www/html
+        chmod 755 /var/www/html
+    fi
+    if [ -d /dev/shm/enc_plain ]; then
+        chown root:root /dev/shm/enc_plain
+        chmod 755 /dev/shm/enc_plain
     fi
     return 0
 }
