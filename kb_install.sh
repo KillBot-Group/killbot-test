@@ -1657,9 +1657,10 @@ sudo chmod -R 755 /var/log/apache2/
 #sudo chown -R www-data:www-data /var/www/html/webroot
 
 #####################
-# Patched PHP (libapache2-mod-php) + mpm_prefork. No php-fpm / mpm_event.
+# Patched PHP (libapache2-mod-php) + mpm_prefork. The distro php-fpm
+# config would send every .php file to FPM, so it stays disabled.
+# Only kb.php is handed to its own pool below.
 echo "Configuring Apache mpm_prefork with patched mod_php..."
-sudo a2dismod proxy_fcgi 2>/dev/null || true
 for fpm_conf in /etc/apache2/conf-enabled/php*-fpm.conf; do
     [[ -e "$fpm_conf" ]] || continue
     sudo a2disconf "$(basename "$fpm_conf" .conf)" || true
@@ -1671,14 +1672,15 @@ fi
 kb_php_enable_apache_module "$KB_PHP_SERIES"
 echo "Enabled Apache module: php${KB_PHP_SERIES} (mpm_prefork, only this series)"
 
-# Apache PHP: dangerous functions are off for every script except kb.php.
-# disable_functions in php.ini cannot be turned back on for one file, so
-# exec/shell_exec/passthru/proc_open stay out of php.ini. Apache turns them
-# off for every PHP file whose name is not kb.php. kb.php calls
-# sudo /etc/init.d/kb, which www-data may run without a password.
-# CLI php.ini is never touched.
+# disable_functions is read only from php.ini at SAPI start. Apache
+# php_admin_value does not apply it, so every mod_php script including
+# get.php is banned in apache2/php.ini. kb.php is the one exception: it is
+# served by its own php-fpm pool, whose admin value still allows
+# exec/shell_exec/passthru/proc_open. kb.php uses them for
+# sudo /etc/init.d/kb. CLI php.ini is never touched.
 kb_php_disable_dangerous_functions() {
-    local ini
+    local ini series sock pool
+    series="${KB_PHP_SERIES}"
     for ini in /etc/php/*/apache2/php.ini; do
         [ -f "$ini" ] || continue
         sudo php /dev/stdin "$ini" <<'PHP'
@@ -1689,13 +1691,22 @@ if ($src === false) {
     fwrite(STDERR, "cannot read {$ini}\n");
     exit(1);
 }
-$keep = array('exec' => true, 'shell_exec' => true, 'passthru' => true, 'proc_open' => true, 'proc_close' => true);
-$ban = array('system' => true, 'popen' => true, 'pcntl_exec' => true, 'assert' => true);
+$ban = array(
+    'system' => true,
+    'exec' => true,
+    'shell_exec' => true,
+    'passthru' => true,
+    'popen' => true,
+    'proc_open' => true,
+    'proc_close' => true,
+    'pcntl_exec' => true,
+    'assert' => true,
+);
 $out = $ban;
 if (preg_match('/^\s*disable_functions\s*=\s*(.*)$/m', $src, $m)) {
     foreach (explode(',', $m[1]) as $fn) {
         $fn = trim($fn);
-        if ($fn === '' || isset($keep[$fn])) {
+        if ($fn === '') {
             continue;
         }
         $out[$fn] = true;
@@ -1714,14 +1725,42 @@ fwrite(STDERR, "Apache disable_functions in {$ini}: " . implode(',', array_keys(
 PHP
     done
 
-    sudo tee /etc/apache2/conf-available/killbot-php-disable.conf >/dev/null <<'EOF'
-# exec, shell_exec, passthru and proc_open are allowed only in kb.php.
-# kb.php uses them to run sudo /etc/init.d/kb (sudoers: www-data, no password).
-<FilesMatch "^(?!kb\.php$).+\.php$">
-    php_admin_value disable_functions "system,exec,shell_exec,passthru,popen,proc_open,proc_close,pcntl_exec,assert"
-</FilesMatch>
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "php${series}-fpm"
+    # The package enables a handler for every .php file. Turn that off so
+    # mod_php keeps get.php and the rest. Only kb.php uses the kb pool.
+    sudo a2disconf "php${series}-fpm" >/dev/null 2>&1 || true
+    kb_php_enable_apache_module "$series"
+    sudo a2enmod proxy >/dev/null
+    sudo a2enmod proxy_fcgi >/dev/null
+
+    sock="/run/php/php${series}-fpm-kb.sock"
+    pool="/etc/php/${series}/fpm/pool.d/kb.conf"
+    sudo tee "$pool" >/dev/null <<EOF
+; Only kb.php. exec/shell_exec stay available here and nowhere else.
+[kb]
+user = www-data
+group = www-data
+listen = ${sock}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 4
+pm.process_idle_timeout = 10s
+clear_env = no
+env[PATH] = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+php_admin_value[disable_functions] = system,popen,pcntl_exec,assert
+security.limit_extensions = .php
+EOF
+    sudo tee /etc/apache2/conf-available/killbot-php-disable.conf >/dev/null <<EOF
+# Comes after mods-enabled/php.conf, so this SetHandler wins for kb.php only.
+<Files "kb.php">
+    SetHandler "proxy:unix:${sock}|fcgi://localhost"
+</Files>
 EOF
     sudo a2enconf killbot-php-disable >/dev/null
+    sudo systemctl enable "php${series}-fpm"
+    sudo systemctl restart "php${series}-fpm"
 }
 kb_php_disable_dangerous_functions
 #####################
