@@ -4163,6 +4163,13 @@ check_solver_health() {
     if [ ! -f "\$KB_HEALTH_CHECK_SCRIPT" ]; then
         return 0
     fi
+    local domain_line domain_value
+    domain_line=\$(grep -E '^GET_PHP_DOMAIN=' "\$KB_HEALTH_CHECK_SCRIPT" | head -n 1)
+    domain_value=\$(printf '%s' "\$domain_line" | sed -n 's/^GET_PHP_DOMAIN="\([^"]*\)".*/\1/p')
+    if [ -z "\${domain_value//[[:space:]]/}" ]; then
+        echo "Error: GET_PHP_DOMAIN is empty in \$KB_HEALTH_CHECK_SCRIPT"
+        return 1
+    fi
     if [ ! -d /var/www/html/solver ]; then
         return 0
     fi
