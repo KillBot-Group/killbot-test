@@ -1667,45 +1667,59 @@ fi
 kb_php_enable_apache_module "$KB_PHP_SERIES"
 echo "Enabled Apache module: php${KB_PHP_SERIES} (mpm_prefork, only this series)"
 
-# kb.php / le_receive_cert.php run under Apache and call exec/shell_exec/passthru.
-# solver installer may have put those in apache2/php.ini; take them out so both
-# installers can share a host. CLI php.ini is never touched (Lua verification.php).
-kb_php_keep_kb_php_functions() {
-    local ini fn
+# Apache PHP: dangerous functions are off for every script except kb.php.
+# disable_functions in php.ini cannot be turned back on for one file, so
+# exec/shell_exec/passthru/proc_open stay out of php.ini. Apache turns them
+# off for every PHP file whose name is not kb.php. kb.php calls
+# sudo /etc/init.d/kb, which www-data may run without a password.
+# CLI php.ini is never touched.
+kb_php_disable_dangerous_functions() {
+    local ini
     for ini in /etc/php/*/apache2/php.ini; do
         [ -f "$ini" ] || continue
         sudo php /dev/stdin "$ini" <<'PHP'
 <?php
 $ini = $argv[1];
 $src = file_get_contents($ini);
-if ($src === false || !preg_match('/^\s*disable_functions\s*=\s*(.*)$/m', $src, $m)) {
-    exit(0);
+if ($src === false) {
+    fwrite(STDERR, "cannot read {$ini}\n");
+    exit(1);
 }
-$keep = array('exec' => true, 'shell_exec' => true, 'passthru' => true);
-$out = array();
-$removed = array();
-foreach (explode(',', $m[1]) as $fn) {
-    $fn = trim($fn);
-    if ($fn === '') {
-        continue;
+$keep = array('exec' => true, 'shell_exec' => true, 'passthru' => true, 'proc_open' => true, 'proc_close' => true);
+$ban = array('system' => true, 'popen' => true, 'pcntl_exec' => true, 'assert' => true);
+$out = $ban;
+if (preg_match('/^\s*disable_functions\s*=\s*(.*)$/m', $src, $m)) {
+    foreach (explode(',', $m[1]) as $fn) {
+        $fn = trim($fn);
+        if ($fn === '' || isset($keep[$fn])) {
+            continue;
+        }
+        $out[$fn] = true;
     }
-    if (isset($keep[$fn])) {
-        $removed[] = $fn;
-        continue;
-    }
-    $out[$fn] = true;
+    $line = 'disable_functions = ' . implode(',', array_keys($out));
+    $src = preg_replace('/^\s*disable_functions\s*=.*$/m', $line, $src, 1);
+} else {
+    $line = 'disable_functions = ' . implode(',', array_keys($out));
+    $src .= "\n" . $line . "\n";
 }
-if (!$removed) {
-    exit(0);
+if (file_put_contents($ini, $src) === false) {
+    fwrite(STDERR, "cannot write {$ini}\n");
+    exit(1);
 }
-$line = 'disable_functions = ' . implode(',', array_keys($out));
-$src = preg_replace('/^\s*disable_functions\s*=.*$/m', $line, $src, 1);
-file_put_contents($ini, $src);
-fwrite(STDERR, "Enabled in {$ini} for kb.php: " . implode(',', $removed) . "\n");
+fwrite(STDERR, "Apache disable_functions in {$ini}: " . implode(',', array_keys($out)) . "\n");
 PHP
     done
+
+    sudo tee /etc/apache2/conf-available/killbot-php-disable.conf >/dev/null <<'EOF'
+# exec, shell_exec, passthru and proc_open are allowed only in kb.php.
+# kb.php uses them to run sudo /etc/init.d/kb (sudoers: www-data, no password).
+<FilesMatch "^(?!kb\.php$).+\.php$">
+    php_admin_value disable_functions "system,exec,shell_exec,passthru,popen,proc_open,proc_close,pcntl_exec,assert"
+</FilesMatch>
+EOF
+    sudo a2enconf killbot-php-disable >/dev/null
 }
-kb_php_keep_kb_php_functions
+kb_php_disable_dangerous_functions
 #####################
 
 # lua-md5 from apt is under 5.1/5.2. Search 5.1-5.4 so require "md5" finds it
