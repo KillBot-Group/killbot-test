@@ -2819,13 +2819,7 @@ if (window.kbTitleVerification==true) {
                         var kbTS = document.createElement('script');
                         kbTS.text = text;
                         kbTS.id = "kb-c";
-                        document.head.appendChild(kbTS);                    
-                        kbTS.onerror = function() {                        
-                            kbTryBackupServer(uri);
-                        };        
-                        kbTS.onload = function() {
-
-                        };
+                        document.head.appendChild(kbTS);
                     })
                     .catch(error => {                    
                         clearTimeout(timeoutId);                                      

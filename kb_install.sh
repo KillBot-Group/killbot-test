@@ -1552,14 +1552,11 @@ sudo sudo tee /etc/apache2/sites-available/000-default.conf > /dev/null <<EOF
     RewriteCond %{REQUEST_URI} !^/le_custom_server/request.php$
     RewriteRule ^ /empty.php [L]
 
-    ErrorLog ${APACHE_LOG_DIR}/error.log
-    CustomLog ${APACHE_LOG_DIR}/access.log combined
+    ErrorLog /error.log
+    CustomLog /access.log combined
 
 </VirtualHost>
 <VirtualHost 127.0.0.1:8443>
-    ServerName $CURRENT_SERVER_IP
-    ServerAlias 127.0.0.1 localhost
-
     ServerAdmin webmaster@localhost
     DocumentRoot /var/www/html
 
@@ -1581,44 +1578,19 @@ sudo sudo tee /etc/apache2/sites-available/000-default.conf > /dev/null <<EOF
 
     SSLEngine on
 
-    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
     SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
 
-    ErrorLog ${APACHE_LOG_DIR}/error.log
-    CustomLog ${APACHE_LOG_DIR}/access.log combined
+    ErrorLog /error.log
+    CustomLog /access.log combined
 
 </VirtualHost>
-
 <VirtualHost 127.0.0.1:8080>
     ServerName $CURRENT_SERVER_IP
     DocumentRoot /var/www/html
 
     RewriteEngine On
 
-    RewriteCond %{REQUEST_METHOD} ^OPTIONS
-
-    RewriteRule .* - [R=403,L]
-
-  <Directory "/var/www/html">
-        Require all denied
-        <Files "kb.php">
-            Require all granted
-        </Files>
-        <Files "le_receive_cert.php">
-            Require all granted
-        </Files>
-    </Directory>
-</VirtualHost>
-<VirtualHost 127.0.0.1:8443>
-    ServerName $CURRENT_SERVER_IP
-    ServerAlias 127.0.0.1 localhost
-    DocumentRoot /var/www/html
-
-    SSLEngine on
-    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem
-    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
-
-    RewriteEngine On
     RewriteCond %{REQUEST_METHOD} ^OPTIONS
     RewriteRule .* - [R=403,L]
 
@@ -5550,36 +5522,7 @@ fi
 SERVER_IP=$(curl -s http://checkip.amazonaws.com)
 #echo "Public server IP: $SERVER_IP"
 
-# Adding blocking rules to prevent the site from being accessed by IP address
-#BLOCK_RULES_80="\n<VirtualHost 127.0.0.1:8080>\n    ServerName $SERVER_IP\n    <Location '/kb.php'>\n        Require all granted\n    </Location>\n    <Location '/'>\n        Require all denied\n        ErrorDocument 403 'Forbidden'\n    </Location>\n</VirtualHost>\n"
-#BLOCK_RULES_443="\n<VirtualHost 127.0.0.1:8443>\n    ServerName $SERVER_IP\n    <Location '/kb.php'>\n        Require all granted\n    </Location>\n    <Location '/'>\n        Require all denied\n        ErrorDocument 403 'Forbidden'\n    </Location>\n</VirtualHost>\n"
-
-BLOCK_RULES_443="\n<VirtualHost 127.0.0.1:8443>\n    ServerName $SERVER_IP\n    ServerAlias 127.0.0.1 localhost\n    DocumentRoot /var/www/html\n\n    SSLEngine on\n    SSLCertificateFile      /etc/ssl/certs/ssl-cert-snakeoil.pem\n    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key\n\n    <Directory \"/var/www/html\">\n        Require all denied\n        <Files \"kb.php\">\n            Require all granted\n        </Files>\n        <Files \"le_receive_cert.php\">\n            Require all granted\n        </Files>\n    </Directory>\n\n</VirtualHost>\n"
-BLOCK_RULES_80="\n<VirtualHost 127.0.0.1:8080>\n    ServerName $SERVER_IP\n    DocumentRoot /var/www/html\n\n      RewriteEngine On\n\n    RewriteCond %{REQUEST_METHOD} ^OPTIONS\n\n    RewriteRule .* - [R=403,L]\n\n  <Directory \"/var/www/html\">\n        Require all denied\n        <Files \"kb.php\">\n            Require all granted\n        </Files>\n        <Files \"le_receive_cert.php\">\n            Require all granted\n        </Files>\n    </Directory>\n\n</VirtualHost>\n"
-
-FILE="/etc/apache2/sites-available/000-default.conf"
-if [ -f "$FILE" ]; then
-    if ! grep -q "ServerName $SERVER_IP" "$FILE"; then
-        echo -e "$BLOCK_RULES_80" | sudo tee -a "$FILE" > /dev/null
-        echo "HTTP IP rules added to $FILE"
-    fi
-    if ! awk -v ip="$SERVER_IP" '
-        /<VirtualHost 127.0.0.1:8443>/ { in_v=1; block="" }
-        in_v { block = block $0 "\n" }
-        in_v && /<\/VirtualHost>/ {
-            if (block ~ ("ServerName " ip)) { found=1 }
-            in_v=0
-        }
-        END { exit !found }
-    ' "$FILE"; then
-        echo -e "$BLOCK_RULES_443" | sudo tee -a "$FILE" > /dev/null
-        echo "HTTPS IP vhost added to $FILE"
-    else
-        echo "Rules already exist in $FILE"
-    fi
-else
-    echo "File $FILE not found, skipping..."
-fi
+# 000-default.conf is written once above. Do not append a second pair of vhosts.
 
 # Stopping Apache before making changes
 sudo systemctl stop apache2
