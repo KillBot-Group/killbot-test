@@ -11,14 +11,9 @@ $kb_windows_1251_domains = [
     'reg-rt.ru'
 ];
 
-// Extra KillBot server added to kb_read_servers_from_checked_file.
-// {domain} is replaced with the current site host (HTTP_HOST / install domain).
-// Examples:
-//   '{domain}/'       -> https://example.com
-//   '{domain}/path'   -> https://example.com/path
-//   '/'               -> current origin (path only)
-$kb_extra_server = '{domain}/';
-$kb_extra_server_used = false;
+// true: first request goes to the domain that served verification.html, no ping.
+// false: ping the server list, then use the nearest host.
+$kb_localhost_use = false;
 
 // Last-resort KillBot server. Used only if every other server in the list
 // failed to answer (ping / fetch timeout).

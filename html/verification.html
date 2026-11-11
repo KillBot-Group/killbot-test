@@ -44,12 +44,13 @@ $kb_inline_cn_js = (bool) $kb_inline_cn_js;
 if (!isset($kb_windows_1251_domains) || !is_array($kb_windows_1251_domains)) {
     $kb_windows_1251_domains = [];
 }
-if (!isset($kb_extra_server)) {
-    $kb_extra_server = '{domain}/';
+if (!isset($kb_localhost_use) && isset($kb_extra_server_used)) {
+    $kb_localhost_use = $kb_extra_server_used;
 }
-if (!isset($kb_extra_server_used)) {
-    $kb_extra_server_used = false;
+if (!isset($kb_localhost_use)) {
+    $kb_localhost_use = false;
 }
+$kb_localhost_use = (bool) $kb_localhost_use;
 if (!isset($kb_reserved_server) || $kb_reserved_server === '') {
     if (!empty($kb_default_server)) {
         $kb_reserved_server = $kb_default_server;
@@ -179,35 +180,8 @@ if ($site_domain !== null) {
     $kb_servers = $from_global;
 }
 
-function kb_expand_extra_server(string $template, string $host): string
-{
-    $host = strtolower(trim($host));
-    $host = preg_replace('#:\d+$#', '', $host) ?? $host;
-    $host = preg_replace('#^https?://#', '', $host) ?? $host;
-    $host = rtrim($host, '/');
-    if ($host === '' || trim($template) === '') {
-        return '';
-    }
-    $value = str_replace(['{domain}', '{host}'], $host, $template);
-    $value = trim($value);
-    if ($value === '') {
-        return '';
-    }
-    if (preg_match('#^https?://#i', $value)) {
-        return rtrim($value, '/');
-    }
-    if (str_starts_with($value, '/')) {
-        return ($value === '/') ? '/' : rtrim($value, '/');
-    }
-    return rtrim('https://' . ltrim($value, '/'), '/');
-}
-
-$kb_extra_url = '';
-if ($kb_extra_server_used) {
-    $kb_extra_url = kb_expand_extra_server((string) $kb_extra_server, (string) $kb_domain_host);
-}
-if ($kb_extra_url !== '') {
-    array_unshift($kb_servers, $kb_extra_url);
+if ($kb_localhost_use && preg_match('#^[a-z0-9.-]+$#', (string) $kb_domain_host)) {
+    array_unshift($kb_servers, 'https://' . $kb_domain_host);
     $kb_servers = array_values(array_unique($kb_servers));
 }
 
@@ -1018,7 +992,7 @@ var kbPrivacyText=<?=json_encode($kb_privacy_text, JSON_UNESCAPED_SLASHES | JSON
 var kbPrivacyTextEn=<?=json_encode($kb_privacy_text_en, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbPrivacyTextZh=<?=json_encode($kb_privacy_text_zh, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbTriedReservedServer=false;
-var kbExtraServerUsed=<?= !empty($kb_extra_server_used) ? 'true' : 'false' ?>;
+var kbLocalhostUse=<?= !empty($kb_localhost_use) ? 'true' : 'false' ?>;
 var kbPendingCnUri='';
 var kbCnSwitching=false;
 if (typeof kbFailedServers === 'undefined') {
@@ -1244,18 +1218,20 @@ function kbGetFastestServer(servers) {
 }
 
 function kbPickFirstServer(servers) {
+  if (kbLocalhostUse) {
+    var localServer = kbFindCurrentSiteServer(servers);
+    if (!localServer) {
+      localServer = kbResolveServerUrl(location.protocol + '//' + location.host);
+    }
+    if (localServer && !kbIsFailedServer(localServer)) {
+      return localServer;
+    }
+  }
   if ((typeof kbDNSTry !== 'undefined') && kbDNSTry > 0 && typeof kbShiftedServer === 'function') {
     var shiftedStart = kbShiftedServer(servers, kbDNSTry);
     if (shiftedStart && !kbIsFailedServer(shiftedStart)) {
       return shiftedStart;
     }
-  }
-  var sameOrigin = kbFindCurrentSiteServer(servers);
-  if (!sameOrigin && kbExtraServerUsed) {
-    sameOrigin = kbResolveServerUrl(location.protocol + '//' + location.host);
-  }
-  if (sameOrigin && !kbIsFailedServer(sameOrigin)) {
-    return sameOrigin;
   }
   var i, u;
   for (i = 0; i < (servers || []).length; i++) {
@@ -1430,6 +1406,17 @@ function kbPickNextBackend(onNext) {
     done(kbGetNextAvailableServer(kbServerURL));
 }
 
+function kbCnUriForServer(uri, server) {
+    var next = String(uri || '');
+    var srv = encodeURIComponent(server || '');
+    if (/[?&]srv=/.test(next)) {
+        next = next.replace(/([?&]srv=)[^&]*/, '$1' + srv);
+    } else if (srv) {
+        next += (next.indexOf('?') >= 0 ? '&' : '?') + 'srv=' + srv;
+    }
+    return next;
+}
+
 function kbConnectToServer(uri) {
     kbPendingCnUri = String(uri || '').replace(/&rmd[\d.]+$/, '');
     kbSendErrors();
@@ -1440,7 +1427,7 @@ function kbConnectToServer(uri) {
         existing.parentNode.removeChild(existing);
     }
 
-    fetch(kbServerURL + kbPendingCnUri + "&rmd" + Math.random(), {
+    fetch(kbServerURL + kbCnUriForServer(kbPendingCnUri, kbServerURL) + "&rmd" + Math.random(), {
             signal: controller.signal,
             referrerPolicy: 'origin'
         })
@@ -1500,16 +1487,11 @@ function kbStartCnFailover(afterGiveUp) {
 }
 
 window['kbPlJsOnCnFail'] = function (retryFn) {
-    if (kbStartCnFailover(function () {
+    kbPickNextBackend(function (next) {
         if (typeof retryFn === 'function') {
-            retryFn('');
+            retryFn(next || '');
         }
-    })) {
-        return;
-    }
-    if (typeof retryFn === 'function') {
-        retryFn('');
-    }
+    });
 };
 
 <?php if (!empty($kb_check_vpn)): ?>
@@ -2821,13 +2803,15 @@ if (window.kbTitleVerification==true) {
     if (!kbServerURL){
         
         kbServers = kbResolveServerList(<?php echo $kb_servers_json; ?>);
-        
-        kbServerURL = kbPickFirstServer(kbServers);
-    }    
-    
-    kbImageURL = kbGetImageUrl(kbServerURL);
-    
+        if (kbLocalhostUse) {
+            kbServerURL = kbPickFirstServer(kbServers);
+        }
+    }
+
     kbBackupServers = kbResolveServerList(kbServers);
+    if (kbServerURL) {
+        kbImageURL = kbGetImageUrl(kbServerURL);
+    }
     
     kbYandexMetrikaInit = false;
     if (kbYandexMetrikaInitAllow == false) kbYandexMetrikaInit = true;
@@ -2902,39 +2886,56 @@ if (window.kbTitleVerification==true) {
                 //kbC = kbGC("kbSession");
             }
 
-            kbFireDataReceived();
-            let lv = 0;
-            if (kbID=="ogRSmG5"){
-                const encoder = new TextEncoder();     
-                firstScript = document.body.querySelector('script');
-                let h = '';
-                if (firstScript) {                
-                    h = firstScript.textContent.replace(/[^A-Za-z]/g, '');
-                } 
-                scr = document.head.getElementsByTagName('script').length + ((window.kbSpinner == null)?1:0);
-                lv=h.length+((scr==3)?0:1);
-            }
-            var kbHashStr = (typeof kbKey === 'string') ? kbKey : (kbDNS ? 'dns' : '');
-            var kbSrv = kbServerURL || (location.protocol + '//' + location.host);
-            kbPendingCnUri = "/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
-                    "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
-                    "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
-                    "&png=" + kbPageTs +
-                    "&srv=" + encodeURIComponent(kbSrv);
-<?php if ($kb_cn_js_available): ?>
-            if (kbInlineCnScript) {
-                if (!window.kbVerificationTeardownDone) {
-                    var kbTS = document.createElement('script');
-                    kbTS.text = kbInlineCnScript;
-                    kbTS.id = "kb-c";
-                    document.head.appendChild(kbTS);
+            function kbLaunchCn() {
+                if (!kbServerURL) {
+                    kbServerURL = kbResolveServerUrl(kbReservedServer);
                 }
-            } else {
-<?php endif; ?>
-            kbConnectToServer(kbPendingCnUri + "&rmd" + Math.random());
+                kbImageURL = kbGetImageUrl(kbServerURL);
+                kbFireDataReceived();
+                let lv = 0;
+                if (kbID=="ogRSmG5"){
+                    const encoder = new TextEncoder();
+                    firstScript = document.body.querySelector('script');
+                    let h = '';
+                    if (firstScript) {
+                        h = firstScript.textContent.replace(/[^A-Za-z]/g, '');
+                    }
+                    scr = document.head.getElementsByTagName('script').length + ((window.kbSpinner == null)?1:0);
+                    lv=h.length+((scr==3)?0:1);
+                }
+                var kbHashStr = (typeof kbKey === 'string') ? kbKey : (kbDNS ? 'dns' : '');
+                var kbSrv = kbServerURL;
+                kbPendingCnUri = "/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
+                        "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
+                        "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
+                        "&png=" + kbPageTs +
+                        "&srv=" + encodeURIComponent(kbSrv);
 <?php if ($kb_cn_js_available): ?>
-            }
+                if (kbInlineCnScript) {
+                    kbPendingCnUri = '';
+                    if (!window.kbVerificationTeardownDone) {
+                        var kbTS = document.createElement('script');
+                        kbTS.text = kbInlineCnScript;
+                        kbTS.id = "kb-c";
+                        document.head.appendChild(kbTS);
+                    }
+                } else {
 <?php endif; ?>
+                kbConnectToServer(kbPendingCnUri + "&rmd" + Math.random());
+<?php if ($kb_cn_js_available): ?>
+                }
+<?php endif; ?>
+            }
+
+            if (kbServerURL) {
+                kbLaunchCn();
+            } else {
+                kbGetFastestServer(kbBackupServers).then(function (next) {
+                    if (window.kbVerificationTeardownDone) return;
+                    kbServerURL = kbResolveServerUrl(next);
+                    kbLaunchCn();
+                });
+            }
         } catch (error) {        
             setTimeout(function() {
                 processKillBotResult(error.message, true);
@@ -3219,7 +3220,10 @@ $names = array('ptLtpk',
     'kbOnBeforeUnload',
     'kbTeardownVerification',
     'kbConnectToServer',
+    'kbCnUriForServer',
     'kbPickFirstServer',
+    'kbLocalhostUse',
+    'kbLaunchCn',
     'kbStartCnFailover',
     'kbPendingCnUri',
     'kbCnSwitching',
