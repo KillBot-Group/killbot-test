@@ -698,6 +698,17 @@ kb_lock_web_tree() {
 }
 kb_lock_web_tree
 
+# le_receive_cert.php runs as www-data (mod_php, no sudo). Domain dirs and
+# existing pem files are often root:root, so writing fullchain.pem fails.
+kb_ssl_writable_for_receive() {
+    sudo mkdir -p /opt/killbot/ssl
+    sudo chown -R www-data:www-data /opt/killbot/ssl
+    sudo find /opt/killbot/ssl -type d -exec chmod 2775 {} +
+    sudo find /opt/killbot/ssl -type f -name 'privkey.pem' -exec chmod 640 {} +
+    sudo find /opt/killbot/ssl -type f ! -name 'privkey.pem' -exec chmod 644 {} +
+    echo "  permissions OK: /opt/killbot/ssl (www-data can write certificates)"
+}
+
 sudo a2enmod ssl
 sudo a2enmod rewrite
 sudo a2enmod proxy
@@ -1790,10 +1801,7 @@ sudo mkdir -p /var/log/killbot/lua
 sudo mkdir -p /opt/killbot/html
 sudo chown -R www-data:www-data /var/log/killbot /var/log/killbot/lua /opt/killbot/lua /opt/killbot/php /opt/killbot/sh /opt/killbot/html
 sudo chown -R www-data:www-data /opt/killbot/settings/
-sudo chown www-data:www-data /opt/killbot/ssl
-sudo chmod 775 /opt/killbot/ssl
-
-echo "  permissions OK: /opt/killbot/ssl (www-data:www-data 775)"
+kb_ssl_writable_for_receive
 
 # /opt/killbot/killbot_revers is written after settings.php so
 # $rewrite_killbot_revers_on_install can be read first.
@@ -2122,6 +2130,7 @@ FILE="/var/www/html/le_receive_cert.php"
 
 sudo chown root:root /var/www/html/le_receive_cert.php
 sudo chmod 644 /var/www/html/le_receive_cert.php
+kb_ssl_writable_for_receive
 kb_lock_web_tree
 
 FILE="/opt/killbot/check_killbot_reverse_proxy.sh"

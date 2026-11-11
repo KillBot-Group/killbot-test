@@ -80,6 +80,22 @@ function le_receive_looks_like_pem_privkey(string $pem): bool
     return le_receive_looks_like_pem($pem);
 }
 
+function le_receive_write_file(string $path, string $contents): bool
+{
+    $dir = dirname($path);
+    if (is_dir($dir)) {
+        @chmod($dir, 0775);
+    }
+    if (file_exists($path) && !is_writable($path)) {
+        @unlink($path);
+    }
+    if (file_exists($path) && !is_writable($path)) {
+        return false;
+    }
+
+    return file_put_contents($path, $contents, LOCK_EX) !== false;
+}
+
 function le_receive_find_certbot(): ?string
 {
     foreach (['/usr/bin/certbot', '/usr/local/bin/certbot'] as $candidate) {
@@ -183,19 +199,37 @@ if (!is_dir($targetDir) && !mkdir($targetDir, 0775, true) && !is_dir($targetDir)
     le_receive_json(500, [
         'status' => 'error',
         'message' => 'Cannot create directory: ' . $targetDir,
-        'hint' => 'sudo mkdir -p ' . $sslBase . ' && sudo chown www-data:www-data ' . $sslBase . ' && sudo chmod 775 ' . $sslBase,
+        'hint' => 'sudo chown -R www-data:www-data ' . $sslBase . ' && sudo chmod -R ug+rwX ' . $sslBase,
+    ]);
+}
+@chmod($targetDir, 0775);
+if (!is_writable($targetDir)) {
+    le_receive_json(500, [
+        'status' => 'error',
+        'message' => 'Directory is not writable: ' . $targetDir,
+        'hint' => 'sudo chown -R www-data:www-data ' . $sslBase . ' && sudo chmod -R ug+rwX ' . $sslBase,
     ]);
 }
 
 $fullchainPath = $targetDir . '/fullchain.pem';
 $privkeyPath = $targetDir . '/privkey.pem';
 
-if (file_put_contents($fullchainPath, $fullchain, LOCK_EX) === false) {
-    le_receive_json(500, ['status' => 'error', 'message' => 'Cannot write fullchain.pem']);
+if (!le_receive_write_file($fullchainPath, $fullchain)) {
+    le_receive_json(500, [
+        'status' => 'error',
+        'message' => 'Cannot write fullchain.pem',
+        'path' => $fullchainPath,
+        'hint' => 'sudo chown -R www-data:www-data ' . $sslBase . ' && sudo chmod -R ug+rwX ' . $sslBase,
+    ]);
 }
-if (file_put_contents($privkeyPath, $privkey, LOCK_EX) === false) {
+if (!le_receive_write_file($privkeyPath, $privkey)) {
     @unlink($fullchainPath);
-    le_receive_json(500, ['status' => 'error', 'message' => 'Cannot write privkey.pem']);
+    le_receive_json(500, [
+        'status' => 'error',
+        'message' => 'Cannot write privkey.pem',
+        'path' => $privkeyPath,
+        'hint' => 'sudo chown -R www-data:www-data ' . $sslBase . ' && sudo chmod -R ug+rwX ' . $sslBase,
+    ]);
 }
 
 chmod($fullchainPath, 0644);
