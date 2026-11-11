@@ -3260,6 +3260,13 @@ configContent="<VirtualHost 127.0.0.1:8443>
         Require all granted
     </Directory>
 
+    # /js/cn.js is PHP that prints JavaScript.
+    Alias /js/cn.js /var/www/html/solver/js/cn.js
+    <Location \"/js/cn.js\">
+        SetHandler application/x-httpd-php
+        Require all granted
+    </Location>
+
 #    RewriteCond %{REQUEST_URI} ^/verification\.php [NC]
 #    RewriteCond %{REQUEST_METHOD} POST
 #    RewriteRule ^(.*)$ /$1 [R=302,L]
@@ -3300,6 +3307,8 @@ configContent+="
 
         ProxyPass /too_many_requests.html !
         ProxyPass /opt/killbot/html/too_many_requests.html !
+
+        ProxyPass /js/cn.js !
 
         ProxyPass /.well-known !
         ProxyPass /var/www/html/.well-known !
@@ -3661,6 +3670,13 @@ configContent="<VirtualHost 127.0.0.1:8443>
         Require all granted
     </Directory>
 
+    # /js/cn.js is PHP that prints JavaScript.
+    Alias /js/cn.js /var/www/html/solver/js/cn.js
+    <Location "/js/cn.js">
+        SetHandler application/x-httpd-php
+        Require all granted
+    </Location>
+
     #Define PROXY_ENABLE
 
     <IfDefine PROXY_ENABLE>
@@ -3684,6 +3700,8 @@ configContent+="
 
         ProxyPass /too_many_requests.html !
         ProxyPass /opt/killbot/html/too_many_requests.html !
+
+        ProxyPass /js/cn.js !
        
         # set X-Real-IP if not exist
         RequestHeader setIfEmpty X-Real-IP "%{REAL_REMOTE_ADDR}e"

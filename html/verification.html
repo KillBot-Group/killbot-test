@@ -1018,6 +1018,9 @@ var kbPrivacyText=<?=json_encode($kb_privacy_text, JSON_UNESCAPED_SLASHES | JSON
 var kbPrivacyTextEn=<?=json_encode($kb_privacy_text_en, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbPrivacyTextZh=<?=json_encode($kb_privacy_text_zh, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbTriedReservedServer=false;
+var kbExtraServerUsed=<?= !empty($kb_extra_server_used) ? 'true' : 'false' ?>;
+var kbPendingCnUri='';
+var kbCnSwitching=false;
 if (typeof kbFailedServers === 'undefined') {
 var kbFailedServers=[];
 }
@@ -1173,15 +1176,8 @@ function kbShiftedServer(servers, offset) {
 }
 
 function kbGetFastestServer(servers) {
-  if ((typeof kbDNSTry !== 'undefined') && kbDNSTry > 0) {
-    var shiftedStart = kbShiftedServer(servers, kbDNSTry);
-    if (shiftedStart && !kbIsFailedServer(shiftedStart)) {
-      return Promise.resolve(shiftedStart);
-    }
-  }
-
   var sameOrigin = kbFindCurrentSiteServer(servers);
-  if (sameOrigin && !kbIsFailedServer(sameOrigin)) {
+  if (sameOrigin && !kbIsFailedServer(sameOrigin) && kbFastestPingDone) {
     return Promise.resolve(sameOrigin);
   }
 
@@ -1245,6 +1241,30 @@ function kbGetFastestServer(servers) {
       }
     }, 6050);
   });
+}
+
+function kbPickFirstServer(servers) {
+  if ((typeof kbDNSTry !== 'undefined') && kbDNSTry > 0 && typeof kbShiftedServer === 'function') {
+    var shiftedStart = kbShiftedServer(servers, kbDNSTry);
+    if (shiftedStart && !kbIsFailedServer(shiftedStart)) {
+      return shiftedStart;
+    }
+  }
+  var sameOrigin = kbFindCurrentSiteServer(servers);
+  if (!sameOrigin && kbExtraServerUsed) {
+    sameOrigin = kbResolveServerUrl(location.protocol + '//' + location.host);
+  }
+  if (sameOrigin && !kbIsFailedServer(sameOrigin)) {
+    return sameOrigin;
+  }
+  var i, u;
+  for (i = 0; i < (servers || []).length; i++) {
+    u = kbResolveServerUrl(servers[i]);
+    if (u && !kbIsFailedServer(u)) {
+      return u;
+    }
+  }
+  return kbResolveServerUrl(kbReservedServer);
 }
 
 function kbEvenSecond() {
@@ -1410,12 +1430,86 @@ function kbPickNextBackend(onNext) {
     done(kbGetNextAvailableServer(kbServerURL));
 }
 
-window['kbPlJsOnCnFail'] = function (retryFn) {
+function kbConnectToServer(uri) {
+    kbPendingCnUri = String(uri || '').replace(/&rmd[\d.]+$/, '');
+    kbSendErrors();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    var existing = document.getElementById('kb-c');
+    if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
+    }
+
+    fetch(kbServerURL + kbPendingCnUri + "&rmd" + Math.random(), {
+            signal: controller.signal,
+            referrerPolicy: 'origin'
+        })
+        .then(response => {
+            clearTimeout(timeoutId);
+            if (!response.ok) throw new Error('Network response was not ok');
+            return response.text();
+        })
+        .then(text => {
+            clearTimeout(timeoutId);
+                        if (window.kbVerificationTeardownDone) return;
+                        var trimmed = (text || '').replace(/^\uFEFF/, '').trim();
+                        if (!trimmed || trimmed.charAt(0) === '<') {
+                            throw new Error('KillBot server returned HTML instead of script');
+                        }
+                        var kbTS = document.createElement('script');
+                        kbTS.text = text;
+                        kbTS.id = "kb-c";
+                        try {
+                            document.head.appendChild(kbTS);
+                        } catch (injectErr) {
+                            kbErrors.push({message: injectErr.message,stack: injectErr.stack,name: injectErr.name});
+                            kbSendErrors();
+                        }
+                    })
+                    .catch(error => {
+                        clearTimeout(timeoutId);
+                        kbErrors.push({message: error.message,stack: error.stack,name: error.name});
+                        kbSendErrors();
+                        document.dispatchEvent(new CustomEvent("kbDataReceived", {
+                            detail: JSON.stringify({ error: true, m: "cn.js fetch failed" })
+                        }));
+                    });
+}
+
+function kbStartCnFailover(afterGiveUp) {
+    if (kbCnSwitching) {
+        return true;
+    }
+    if (!kbPendingCnUri) {
+        return false;
+    }
+    kbCnSwitching = true;
     kbPickNextBackend(function (next) {
-        if (typeof retryFn === 'function') {
-            retryFn(next || '');
+        kbCnSwitching = false;
+        if (!next) {
+            if (typeof afterGiveUp === 'function') {
+                afterGiveUp();
+            }
+            return;
         }
+        kbRes = null;
+        kbFireDataReceived();
+        kbConnectToServer(kbPendingCnUri);
     });
+    return true;
+}
+
+window['kbPlJsOnCnFail'] = function (retryFn) {
+    if (kbStartCnFailover(function () {
+        if (typeof retryFn === 'function') {
+            retryFn('');
+        }
+    })) {
+        return;
+    }
+    if (typeof retryFn === 'function') {
+        retryFn('');
+    }
 };
 
 <?php if (!empty($kb_check_vpn)): ?>
@@ -2568,18 +2662,32 @@ function kbFireDataReceived(){
 
 function kbOnDataReceived(event) {
     if (window.kbVerificationTeardownDone) return;
+    if (kbCnSwitching) return;
     if (kbRes != null) return;
     var em = "";
+    var parsed = null;
     try {
         if (event.detail){
-            kbRes = JSON.parse(event.detail);
+            parsed = JSON.parse(event.detail);
         }
     } catch (error) {
         em = error.message + "; " + event.detail;
         kbErrors.push({message: error.message,stack: error.stack,name: error.name});
         kbSendErrors();
-        kbRes = null;
+        parsed = null;
     }
+    if (parsed == null || parsed.error === true || parsed.error === 'true' || parsed.kbWr === 1) {
+        if (kbStartCnFailover(function () {
+            kbRes = parsed;
+            setTimeout(function() {
+                if (window.kbVerificationTeardownDone) return;
+                processKillBotResult(em, true);
+            }, kbTimeout);
+        })) {
+            return;
+        }
+    }
+    kbRes = parsed;
     setTimeout(function() {
         if (window.kbVerificationTeardownDone) return;
         processKillBotResult(em, true);
@@ -2714,7 +2822,7 @@ if (window.kbTitleVerification==true) {
         
         kbServers = kbResolveServerList(<?php echo $kb_servers_json; ?>);
         
-        kbServerURL = await kbGetFastestServer(kbServers);
+        kbServerURL = kbPickFirstServer(kbServers);
     }    
     
     kbImageURL = kbGetImageUrl(kbServerURL);
@@ -2794,46 +2902,6 @@ if (window.kbTitleVerification==true) {
                 //kbC = kbGC("kbSession");
             }
 
-            function kbConnectToServer(uri) {
-                kbSendErrors();
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 6000);
-
-                fetch(kbServerURL + uri, {
-                        signal: controller.signal
-                    })
-                    .then(response => {
-                        clearTimeout(timeoutId);
-                        if (!response.ok) throw new Error('Network response was not ok');
-                        return response.text(); 
-                    })
-                    .then(text => {
-                        clearTimeout(timeoutId);
-                        if (window.kbVerificationTeardownDone) return;
-                        var trimmed = (text || '').replace(/^\uFEFF/, '').trim();
-                        if (!trimmed || trimmed.charAt(0) === '<') {
-                            throw new Error('KillBot server returned HTML instead of script');
-                        }
-                        var kbTS = document.createElement('script');
-                        kbTS.text = text;
-                        kbTS.id = "kb-c";
-                        document.head.appendChild(kbTS);
-                    })
-                    .catch(error => {                    
-                        clearTimeout(timeoutId);                                      
-                        kbErrors.push({message: error.message,stack: error.stack,name: error.name});
-                        kbSendErrors();
-                        kbTryBackupServer(uri);
-                    });
-
-                function kbTryBackupServer(uri) {
-                    kbPickNextBackend(function (next) {
-                        if (!next) return;
-                        kbConnectToServer(uri);
-                    });
-                }
-            }
-
             kbFireDataReceived();
             let lv = 0;
             if (kbID=="ogRSmG5"){
@@ -2848,6 +2916,11 @@ if (window.kbTitleVerification==true) {
             }
             var kbHashStr = (typeof kbKey === 'string') ? kbKey : (kbDNS ? 'dns' : '');
             var kbSrv = kbServerURL || (location.protocol + '//' + location.host);
+            kbPendingCnUri = "/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
+                    "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
+                    "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
+                    "&png=" + kbPageTs +
+                    "&srv=" + encodeURIComponent(kbSrv);
 <?php if ($kb_cn_js_available): ?>
             if (kbInlineCnScript) {
                 if (!window.kbVerificationTeardownDone) {
@@ -2858,11 +2931,7 @@ if (window.kbTitleVerification==true) {
                 }
             } else {
 <?php endif; ?>
-            kbConnectToServer("/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
-                    "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
-                    "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
-                    "&png=" + kbPageTs +
-                    "&srv=" + encodeURIComponent(kbSrv) + "&rmd" + Math.random());
+            kbConnectToServer(kbPendingCnUri + "&rmd" + Math.random());
 <?php if ($kb_cn_js_available): ?>
             }
 <?php endif; ?>
@@ -3150,6 +3219,10 @@ $names = array('ptLtpk',
     'kbOnBeforeUnload',
     'kbTeardownVerification',
     'kbConnectToServer',
+    'kbPickFirstServer',
+    'kbStartCnFailover',
+    'kbPendingCnUri',
+    'kbCnSwitching',
     'kbInlineCnSession',
     'kbInlineCnScript',
     'kbTryBackupServer',
