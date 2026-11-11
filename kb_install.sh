@@ -2806,8 +2806,7 @@ end
 
 --    r.headers_out["X-Debug-Remote-Addr-2"] = remote_addr
 
-    -- Same fields Apache puts in the request env: User-Agent, REAL_REMOTE_ADDR, KBSESSION, Host.
-    local line = table.concat({user_agent, remote_addr, kb_session, http_host}, "")
+    local line = table.concat({kb_lua_script}, "")
 
     local expected_hash = r.subprocess_env["KBCHECK"] or "123"
     local computed_hash = ""
@@ -4518,6 +4517,7 @@ declare cdn_domain=""
 declare cdn_paths=""
 declare cdn_static=""
 declare https="https"
+declare cv_b64=""
 
 DNS_SERVERS=("77.88.8.8" "8.8.8.8")  # yandex, Google
 RANDOM_INDEX=\$(( \${#DNS_SERVERS[@]} > 0 ? RANDOM % \${#DNS_SERVERS[@]} : 0 ))
@@ -4628,6 +4628,13 @@ kb_install_valid_https() {
     [ "\$1" = "http" ] || [ "\$1" = "https" ]
 }
 
+kb_install_valid_cv() {
+    local c="\$1"
+    [ -z "\$c" ] && return 0
+    [ "\${#c}" -gt 8192 ] && return 1
+    [[ "\$c" =~ ^[A-Za-z0-9+/=]+\$ ]]
+}
+
 kb_install_valid_cdns() {
     [ "\$1" = "0" ] || [ "\$1" = "1" ] || [ "\$1" = "2" ]
 }
@@ -4736,6 +4743,8 @@ while [[ "\$#" -gt 0 ]]; do
             le="\$2"; shift 2;;
         -www)
             www="\$2"; shift 2;;
+        -cv)
+            cv_b64="\$2"; shift 2;;
         *)
             trimmed="\$(echo -n "\$1" | xargs)"
             [[ -n "\$trimmed" ]] && { echo "Unknown arg: '\$1'"; exit 1; } || shift 1
@@ -4808,6 +4817,10 @@ if ! kb_install_valid_csv "\$wlua" ua; then
 fi
 if ! kb_install_valid_csv "\$wlpath" path; then
     echo "Invalid -wlpath value." >&2
+    exit 1
+fi
+if ! kb_install_valid_cv "\$cv_b64"; then
+    echo "Invalid -cv value." >&2
     exit 1
 fi
 
@@ -5264,6 +5277,31 @@ is_wildcard_cert() {
 
 wlpath="\$wlpath,/.well-known/"
 
+php_script=""
+apache_script=""
+lua_script=""
+lua_script2=""
+if [[ -n "\$cv_b64" ]]; then
+    cv_json=\$(printf '%s' "\$cv_b64" | base64 -d 2>/dev/null || true)
+    if [[ -z "\$cv_json" ]]; then
+        echo "Error: invalid -cv (base64 decode failed)" >&2
+        exit 1
+    fi
+    php_script=\$(printf '%s' "\$cv_json" | jq -r '.php // empty')
+    apache_script=\$(printf '%s' "\$cv_json" | jq -r '.apache // empty')
+    lua_script=\$(printf '%s' "\$cv_json" | jq -r '.lua // empty')
+    lua_script2=\$(printf '%s' "\$cv_json" | jq -r '.lua2 // empty')
+    if [[ -z "\$lua_script" || "\$lua_script" == "null" ]]; then
+        lua_script="user_agent,remote_addr,kb_session,http_host"
+        echo "Warning: cv lua formula empty, using default lua hash fields"
+    else
+        echo "OK: cv hash formula received from KillBot server"
+    fi
+else
+    lua_script="user_agent,remote_addr,kb_session,http_host"
+    echo "Warning: cv not provided, using default lua hash fields"
+fi
+
 lua_agents=\$(make_lua_array "allowed_agents" "\$wlua")
 lua_paths=\$(make_lua_array "allowed_paths" "\$wlpath")
 lua_ips=\$(make_lua_array "allowed_ips" "\$wlip")
@@ -5302,8 +5340,10 @@ kb_sed_repl() {
 lua_paths_sed="\$(kb_sed_repl "\$lua_paths")"
 lua_agents_sed="\$(kb_sed_repl "\$lua_agents")"
 lua_ips_sed="\$(kb_sed_repl "\$lua_ips")"
+lua_script_sed="\$(kb_sed_repl "\$lua_script")"
+lua_script2_sed="\$(kb_sed_repl "\$lua_script2")"
 domain_sed="\$(kb_sed_repl "\$domain_without_www")"
-sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" -e "s|kb_lua_paths|\${lua_paths_sed}|g" -e "s|kb_lua_ips|\${lua_ips_sed}|g" /opt/killbot/kb.lua > /opt/killbot/lua/\$domain_without_www.lua
+sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_script|\${lua_script_sed}|g" -e "s|kb2_lua_script|\${lua_script2_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" -e "s|kb_lua_paths|\${lua_paths_sed}|g" -e "s|kb_lua_ips|\${lua_ips_sed}|g" /opt/killbot/kb.lua > /opt/killbot/lua/\$domain_without_www.lua
 
 
 
@@ -5311,7 +5351,7 @@ sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" 
 #chmod 755 /opt/killbot/php/\$domain_without_www.php
 
 #Updating apache443-killbot.sh
-sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443-killbot.sh > /opt/killbot/sh/\$domain_without_www-killbot.sh
+sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*apache_script\*\*\*|\$apache_script|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443-killbot.sh > /opt/killbot/sh/\$domain_without_www-killbot.sh
 sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443.sh > /opt/killbot/sh/\$domain_without_www.sh
 
 #Disable SSL if the domain does not have "www"
@@ -6629,6 +6669,17 @@ if (\$kb_config_locked && !in_array(\$type, \$kb_readonly_types, true)) {
 \$wlip = kb_sanitize(\$_GET["wlip"] ?? "") ?? "";
 \$wlua = kb_sanitize(\$_GET["wlua"] ?? "") ?? "";
 \$dns_bots_allowed = isset(\$_GET["dns_bots_allowed"]) ? kb_sanitize(base64_decode((string) \$_GET["dns_bots_allowed"])) : "";
+\$cv_b64 = isset(\$_GET["cv"]) ? preg_replace('/[^A-Za-z0-9+\/=]/', '', (string) \$_GET["cv"]) : "";
+\$cv_ok = "";
+if (\$cv_b64 !== "") {
+    \$cv_decoded = base64_decode(\$cv_b64, true);
+    if (\$cv_decoded !== false) {
+        \$cv_obj = json_decode(\$cv_decoded);
+        if (is_object(\$cv_obj) && (!empty(\$cv_obj->lua) || !empty(\$cv_obj->php) || !empty(\$cv_obj->apache))) {
+            \$cv_ok = \$cv_b64;
+        }
+    }
+}
 \$wlpath = kb_sanitize(\$_GET["wlpath"] ?? "") ?? "";
 \$t = kb_sanitize(\$_GET["t"] ?? null);
 \$le = kb_sanitize(\$_GET["le"] ?? "1");
@@ -7040,6 +7091,7 @@ if (\$type == "install"){
     if (\$wlip)   \$command .= " -wlip " . escapeshellarg(\$wlip);
     if (\$wlua)   \$command .= " -wlua " . escapeshellarg(\$wlua);
     if (\$wlpath)   \$command .= " -wlpath " . escapeshellarg(\$wlpath);
+    if (\$cv_ok)  \$command .= " -cv " . escapeshellarg(\$cv_ok);
     if (\$t)      \$command .= " -t " . escapeshellarg(\$t);
     if (\$https)      \$command .= " -https " . escapeshellarg(\$https);
     \$command .= " -le " . escapeshellarg((string) \$le);
