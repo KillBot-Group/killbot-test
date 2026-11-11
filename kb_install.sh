@@ -1508,8 +1508,9 @@ server {
 
         if (\$kb_should_block) { return 444; }
 
-        proxy_ssl_server_name on;
-        proxy_ssl_name \$host;
+        # Do not send the unknown Host as SNI. Apache then uses the
+        # catch-all :8443 vhost and rewrites to empty.php.
+        proxy_ssl_server_name off;
         proxy_ssl_verify off;
 
         proxy_http_version 1.1;
@@ -1610,6 +1611,11 @@ EOF
 # A leftover ServerName like \$SERVER_IP makes every HTTPS-to-Apache :8443
 # return 421 (SNI/Host mismatch). 000-default.conf already has :8443.
 sudo a2dissite 000-default-ssl >/dev/null 2>&1 || true
+# 00-site.conf sorts before 000-default.conf ('-' < '0'), so the site vhost
+# becomes Apache's default and unknown Host never reaches empty.php.
+sudo a2ensite 000-default >/dev/null 2>&1 || true
+sudo ln -sfn /etc/apache2/sites-available/000-default.conf /etc/apache2/sites-enabled/0-default.conf
+sudo rm -f /etc/apache2/sites-enabled/000-default.conf
 
 kb_sysctl_system
 sysctl net.ipv4.tcp_syncookies net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_synack_retries || true
