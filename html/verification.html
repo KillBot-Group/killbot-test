@@ -157,28 +157,26 @@ $kb_servers = $kb_servers_default;
 $global_checked_file = '/opt/killbot/settings/killbot_revers_checked';
 $legacy_global_checked_file = '/opt/killbot/killbot_revers_checked';
 
+$from_global = kb_read_servers_from_checked_file($global_checked_file);
+if ($from_global === []) {
+    $from_global = kb_read_servers_from_checked_file($legacy_global_checked_file);
+}
+
 if ($site_domain !== null) {
     $site_checked_file = "/opt/killbot/settings/{$site_domain}/killbot_revers_checked";
     $from_site = kb_read_servers_from_checked_file($site_checked_file);
-    if ($from_site !== []) {
+    if (count($from_site) === 1) {
+        $kb_servers = array_values(array_unique(array_merge($from_site, $from_global)));
+        if ($kb_servers === []) {
+            $kb_servers = $kb_servers_default;
+        }
+    } elseif ($from_site !== []) {
         $kb_servers = $from_site;
-    } else {
-        $from_global = kb_read_servers_from_checked_file($global_checked_file);
-        if ($from_global === []) {
-            $from_global = kb_read_servers_from_checked_file($legacy_global_checked_file);
-        }
-        if ($from_global !== []) {
-            $kb_servers = $from_global;
-        }
-    }
-} else {
-    $from_global = kb_read_servers_from_checked_file($global_checked_file);
-    if ($from_global === []) {
-        $from_global = kb_read_servers_from_checked_file($legacy_global_checked_file);
-    }
-    if ($from_global !== []) {
+    } elseif ($from_global !== []) {
         $kb_servers = $from_global;
     }
+} elseif ($from_global !== []) {
+    $kb_servers = $from_global;
 }
 
 function kb_expand_extra_server(string $template, string $host): string
