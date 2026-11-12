@@ -2757,7 +2757,7 @@ local function log_passed(r, reason)
     if not should_log_visit(r) then
         return
     end
-    append_access_log("/var/log/apache2/kb_domain.passed.access.log", access_line(r, '"' .. log_escape(reason) .. '"'))
+    append_access_log("/var/log/apache2/kb_domain.passed.access.log", access_line(r, reason))
 end
 
 function handle(r)
@@ -2792,7 +2792,7 @@ function handle(r)
     end
 
     if is_ip_in_allowed_url(remote_addr, http_host) then
-        log_passed(r, "пропуск: IP в сгенерированном списке официальных сетей")
+        log_passed(r, "ip_official_whitelist")
         return apache2.DECLINED
     end
 
@@ -2871,13 +2871,13 @@ end
 
     if ip_allowed(remote_addr_org) then
         log_message("ip:"  .. remote_addr_org .. " ip_allowed: " .. remote_addr_org .. " DECLINED",http_host)
-        log_passed(r, "пропуск: IP в разрешённых IP")
+        log_passed(r, "ip_whitelisted")
         return apache2.DECLINED
     end
 
     if path_allowed(r.unparsed_uri) then
         log_message("ip:"  .. remote_addr_org .. " path_allowed: " .. r.unparsed_uri .. " DECLINED",http_host)
-        log_passed(r, "пропуск: путь в разрешённых путях")
+        log_passed(r, "path_whitelisted")
         return apache2.DECLINED
     end
 
@@ -2908,9 +2908,9 @@ end
     if agent_allowed(user_agent) then
         log_message("ip:"  .. remote_addr_org .. " trusted user agent detected : " .. user_agent .. " DECLINED",http_host)
         if is_real_bot == "bot_true" then
-            log_passed(r, "пропуск: обратный DNS совпал с user agent бота")
+            log_passed(r, "dns_resolve_success")
         else
-            log_passed(r, "пропуск: user agent в списке разрешённых")
+            log_passed(r, "ua_whitelisted")
         end
         return apache2.DECLINED
     end
