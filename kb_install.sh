@@ -1844,6 +1844,15 @@ else
     exit 1
 fi
 
+FILE="/opt/killbot/html/cn.js"
+kb_download "$FILE" "html/cn.js"
+if [ $? -eq 0 ]; then
+    echo "The inline cn.js has been successfully loaded."
+else
+    echo "Error loading inline cn.js."
+    exit 1
+fi
+
 FILE="/opt/killbot/html/verification_options.php"
 if [ ! -f "$FILE" ]; then
     kb_download "$FILE" "html/verification_options.php"
@@ -1895,8 +1904,8 @@ $kb_le_letsencrypt_dir = '/etc/letsencrypt';
 // Ignored when $kb_accept_centralized_certs is false.
 $kb_le_remove_local_letsencrypt = true;
 
-// Inline /js/cn.js into verification.html when the file exists on this server.
-// false = browser fetches cn.js over HTTP as before.
+// Inline /opt/killbot/html/cn.js into the verification page.
+// false = browser fetches /js/cn.js over HTTP as before.
 $kb_inline_cn_js = false;
 
 // Rewrite /opt/killbot/killbot_revers (shared backend list) on kb_install.sh.
@@ -1910,8 +1919,8 @@ fi
 if [ -f /opt/killbot/settings.php ] && ! grep -q 'kb_inline_cn_js' /opt/killbot/settings.php; then
 cat >> /opt/killbot/settings.php <<'EOF'
 
-// Inline /js/cn.js into verification.html when the file exists on this server.
-// false = browser fetches cn.js over HTTP as before.
+// Inline /opt/killbot/html/cn.js into the verification page.
+// false = browser fetches /js/cn.js over HTTP as before.
 $kb_inline_cn_js = false;
 EOF
     echo "Added kb_inline_cn_js to /opt/killbot/settings.php"
@@ -2239,6 +2248,7 @@ for f in \
     /opt/killbot/html/BlockBot.html \
     /opt/killbot/html/Expired.html \
     /opt/killbot/html/verification.php \
+    /opt/killbot/html/cn.js \
     /opt/killbot/html/verification_options.php \
     /opt/killbot/html/verification_options_example.php
 do
@@ -5939,8 +5949,8 @@ sudo systemctl daemon-reload
 mkdir -p /opt/killbot/sh /opt/killbot/lua
 cat > /opt/killbot/sh/waf_http_data.sh << 'WAF_HTTP_DATA_EOF'
 #!/bin/bash
-# Build /opt/killbot/lua/{domain}-waf.lua from WAF rules.
-# stdin: base64 JSON of rule groups (paths + params).
+# Build /opt/killbot/lua/{domain}-waf.lua for admin path allow-lists.
+# stdin: base64 JSON with an admin object (paths, ips, user_ids).
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -5978,49 +5988,9 @@ if (!is_array($decoded)) {
     fwrite(STDERR, "bad waf json\n");
     exit(1);
 }
-$waf_on = 1;
 $admin_in = array();
-if (isset($decoded['rules']) || isset($decoded['admin']) || array_key_exists('waf_on', $decoded)) {
-    $rules = (isset($decoded['rules']) && is_array($decoded['rules'])) ? $decoded['rules'] : array();
-    $waf_on = !empty($decoded['waf_on']) ? 1 : 0;
-    $admin_in = (isset($decoded['admin']) && is_array($decoded['admin'])) ? $decoded['admin'] : array();
-}
-else {
-    $rules = $decoded;
-}
-
-$path_types = array('none', 'number', 'string', 'string_space', 'safe', 'safe_short');
-$value_types = array_merge($path_types, array('json', 'serialized', 'email', 'url', 'ip', 'uuid', 'date', 'bool', 'float', 'hex', 'base64', 'phone'));
-$body_types = array_merge($value_types, array('html', 'php', 'js'));
-
-function waf_keep($value, $allowed) {
-    $value = (string) $value;
-    return in_array($value, $allowed, true) ? $value : '';
-}
-
-function waf_list($values, $allowed) {
-    if (!is_array($values)) {
-        return array();
-    }
-    $out = array();
-    foreach ($values as $value) {
-        $value = waf_keep($value, $allowed);
-        if ($value !== '' && !in_array($value, $out, true)) {
-            $out[] = $value;
-        }
-    }
-    return $out;
-}
-
-function waf_len($value) {
-    $length = (int) $value;
-    if ($length < 0) {
-        return 0;
-    }
-    if ($length > 10000000) {
-        return 10000000;
-    }
-    return $length;
+if (isset($decoded['admin']) && is_array($decoded['admin'])) {
+    $admin_in = $decoded['admin'];
 }
 
 function waf_quote($value) {
@@ -6034,101 +6004,6 @@ function waf_lua_strings($values) {
         $parts[] = waf_quote($value);
     }
     return '{' . implode(',', $parts) . '}';
-}
-
-$lua_rules = array();
-foreach (array_slice($rules, 0, 200) as $group) {
-    if (!is_array($group)) {
-        continue;
-    }
-    $paths_in = isset($group['paths']) && is_array($group['paths']) ? $group['paths'] : array();
-    $params_in = isset($group['params']) && is_array($group['params']) ? $group['params'] : array();
-    $paths = array();
-    foreach (array_slice($paths_in, 0, 30) as $path) {
-        if (!is_array($path)) {
-            continue;
-        }
-        $mask = isset($path['mask']) ? trim((string) $path['mask']) : '';
-        if ($mask === '' || (isset($mask[0]) && $mask[0] !== '/' && $mask[0] !== '*')) {
-            continue;
-        }
-        if (preg_match('/[\s\'"`;\\\\<>|#&=]/', $mask) || strpos($mask, '..') !== false) {
-            continue;
-        }
-        if (strlen($mask) > 1024) {
-            $mask = substr($mask, 0, 1024);
-        }
-        $paths[] = array(
-            'mask' => $mask,
-            'allow_get' => !empty($path['allow_get']) ? 1 : 0,
-            'allow_post' => !empty($path['allow_post']) ? 1 : 0,
-            'max_length' => waf_len(isset($path['max_length']) ? $path['max_length'] : 0),
-            'validators' => waf_list(isset($path['validators']) ? $path['validators'] : array(), $path_types),
-        );
-    }
-    if (!$paths) {
-        continue;
-    }
-    $params = array();
-    foreach (array_slice($params_in, 0, 40) as $param) {
-        if (!is_array($param)) {
-            continue;
-        }
-        $name = isset($param['name']) ? trim((string) $param['name']) : '';
-        if (!preg_match('/^[\p{L}\p{N}_\-\[\]*]{1,128}$/u', $name)) {
-            continue;
-        }
-        $extensions = array();
-        $ext_raw = isset($param['extensions']) ? strtolower((string) $param['extensions']) : '';
-        foreach (preg_split('/[\s,;]+/', $ext_raw) as $ext) {
-            $ext = ltrim((string) $ext, '.');
-            if ($ext !== '' && preg_match('/^[a-z0-9]{1,10}$/', $ext) && !in_array($ext, $extensions, true)) {
-                $extensions[] = $ext;
-            }
-            if (count($extensions) >= 30) {
-                break;
-            }
-        }
-        $files = !empty($param['files']) ? 1 : 0;
-        if ($files && !$extensions) {
-            $files = 0;
-        }
-        $params[] = array(
-            'name' => $name,
-            'get' => !empty($param['get']) ? 1 : 0,
-            'post' => !empty($param['post']) ? 1 : 0,
-            'max_length' => waf_len(isset($param['max_length']) ? $param['max_length'] : 0),
-            'validators' => waf_list(isset($param['validators']) ? $param['validators'] : array(), $value_types),
-            'body_types' => waf_list(isset($param['body_types']) ? $param['body_types'] : array(), $body_types),
-            'files' => $files,
-            'extensions' => $extensions,
-        );
-    }
-    $lua_rules[] = array('paths' => $paths, 'params' => $params);
-}
-
-$chunks = array();
-foreach ($lua_rules as $rule) {
-    $path_chunks = array();
-    foreach ($rule['paths'] as $path) {
-        $path_chunks[] = '{mask=' . waf_quote($path['mask'])
-            . ',allow_get=' . (int) $path['allow_get']
-            . ',allow_post=' . (int) $path['allow_post']
-            . ',max_length=' . (int) $path['max_length']
-            . ',validators=' . waf_lua_strings($path['validators']) . '}';
-    }
-    $param_chunks = array();
-    foreach ($rule['params'] as $param) {
-        $param_chunks[] = '{name=' . waf_quote($param['name'])
-            . ',get=' . (int) $param['get']
-            . ',post=' . (int) $param['post']
-            . ',max_length=' . (int) $param['max_length']
-            . ',validators=' . waf_lua_strings($param['validators'])
-            . ',body_types=' . waf_lua_strings($param['body_types'])
-            . ',files=' . (int) $param['files']
-            . ',extensions=' . waf_lua_strings($param['extensions']) . '}';
-    }
-    $chunks[] = '{paths={' . implode(',', $path_chunks) . '},params={' . implode(',', $param_chunks) . '}}';
 }
 
 $admin_paths = array();
@@ -6174,14 +6049,7 @@ foreach (array_slice($admin_ip_lines, 0, 80) as $ip) {
     }
 }
 
-$lua = <<<'LUA'
-require "apache2"
-
-local rules = {
-LUA;
-$lua .= implode(",\n", $chunks);
-$lua .= "\n}\n";
-$lua .= 'local waf_on = ' . (int) $waf_on . "\n";
+$lua = "require \"apache2\"\n";
 $lua .= 'local admin_paths = ' . waf_lua_strings($admin_paths) . "\n";
 $lua .= 'local admin_users = ' . waf_lua_strings($admin_users) . "\n";
 $lua .= 'local admin_ips = ' . waf_lua_strings($admin_ips) . "\n";
@@ -6216,192 +6084,6 @@ local function mask_match(mask, value)
     flush(false)
     pat = pat .. "$"
     return value:match(pat) ~= nil
-end
-
-local function too_long(value, limit)
-    limit = tonumber(limit) or 0
-    if limit <= 0 then
-        return false
-    end
-    return #value > limit
-end
-
-local function has_comment(value)
-    return value:find("--", 1, true) or value:find("/*", 1, true) or value:find("*/", 1, true)
-end
-
-local function has_byte(value, forbidden)
-    for i = 1, #value do
-        if forbidden:find(value:sub(i, i), 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
-local function ascii_token(value, allow_space)
-    for i = 1, #value do
-        local c = value:sub(i, i)
-        local b = c:byte()
-        if b < 128 then
-            if not c:match("[%w_%-]") and not (allow_space and c == " ") then
-                return false
-            end
-        end
-    end
-    return true
-end
-
-local function type_ok(kind, value)
-    if kind == "none" then
-        return true
-    end
-    if kind == "number" then
-        return value:match("^%d+$") ~= nil
-    end
-    if kind == "string" then
-        return ascii_token(value, false)
-    end
-    if kind == "string_space" then
-        return ascii_token(value, true)
-    end
-    if kind == "safe" then
-        return not has_comment(value) and not has_byte(value, ".*'\"`;\\-#()<>|&,%?=+{}[]`")
-    end
-    if kind == "safe_short" then
-        return not has_comment(value) and not has_byte(value, "'\"`;\\#<>")
-    end
-    if kind == "json" then
-        return value:match("^%s*[{%[]") ~= nil
-    end
-    if kind == "serialized" then
-        return value:match("^%s*[aObisdN]:") ~= nil
-    end
-    if kind == "email" then
-        return value:match("^[%w%._%+%-]+@[%w%.%-]+%.[%a][%a]+$") ~= nil
-    end
-    if kind == "url" then
-        return value:match("^https?://[%w%.%-%_%~%:%/%?#%[%]%@%!%$%&%'%(%)%*%+%,%;%=]+$") ~= nil
-    end
-    if kind == "ip" then
-        return value:match("^%d+%.%d+%.%d+%.%d+$") ~= nil or value:match("^[%x:]+$") ~= nil
-    end
-    if kind == "uuid" then
-        return value:match("^[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+%-[0-9a-fA-F]+$") ~= nil
-    end
-    if kind == "date" then
-        return value:match("^%d%d%d%d%-%d%d%-%d%d$") ~= nil or value:match("^%d%d%.%d%d%.%d%d%d%d$") ~= nil
-    end
-    if kind == "bool" then
-        local low = value:lower()
-        return low == "0" or low == "1" or low == "true" or low == "false" or low == "yes" or low == "no"
-    end
-    if kind == "float" then
-        return value:match("^%-?%d+%.?%d*$") ~= nil or value:match("^%-?%d*%.%d+$") ~= nil
-    end
-    if kind == "hex" then
-        return value:match("^[0-9a-fA-F]+$") ~= nil
-    end
-    if kind == "base64" then
-        return value:match("^[A-Za-z0-9%+/=]+$") ~= nil
-    end
-    if kind == "phone" then
-        return value:match("^%+?[%d%s%-%(%)]+$") ~= nil and value:match("%d") ~= nil
-    end
-    if kind == "html" or kind == "php" or kind == "js" then
-        return not value:find("\0", 1, true)
-    end
-    return false
-end
-
-local function any_type(kinds, value)
-    if kinds == nil or #kinds == 0 then
-        return true
-    end
-    for _, kind in ipairs(kinds) do
-        if type_ok(kind, value) then
-            return true
-        end
-    end
-    return false
-end
-
-local function find_param(params, name)
-    local star = nil
-    for _, param in ipairs(params) do
-        if param.name == name then
-            return param
-        end
-        if param.name == "*" then
-            star = param
-        end
-    end
-    return star
-end
-
-local function values_of(raw)
-    if type(raw) == "table" then
-        return raw
-    end
-    return {raw}
-end
-
-local function check_fields(params, fields, from_post)
-    for name, raw in pairs(fields) do
-        local param = find_param(params, tostring(name))
-        if param == nil then
-            return false
-        end
-        if from_post then
-            if param.post ~= 1 then
-                return false
-            end
-        elseif param.get ~= 1 then
-            return false
-        end
-        local kinds = {}
-        for _, kind in ipairs(param.validators or {}) do
-            kinds[#kinds + 1] = kind
-        end
-        if from_post then
-            for _, kind in ipairs(param.body_types or {}) do
-                kinds[#kinds + 1] = kind
-            end
-        end
-        for _, value in ipairs(values_of(raw)) do
-            value = tostring(value)
-            if too_long(value, param.max_length) or not any_type(kinds, value) then
-                return false
-            end
-        end
-    end
-    return true
-end
-
-local function file_ok(params, body)
-    local saw = false
-    for name in body:gmatch('filename="([^"]+)"') do
-        saw = true
-        local ext = name:match("%.([%w]+)$")
-        ext = ext and ext:lower() or ""
-        local param = find_param(params, "*")
-        if param == nil or param.files ~= 1 then
-            return false
-        end
-        local allowed = false
-        for _, one in ipairs(param.extensions or {}) do
-            if one == ext then
-                allowed = true
-            end
-        end
-        if not allowed then
-            return false
-        end
-    end
-    if not saw then
-        return true
-    end
-    return true
 end
 
 local function list_has(list, value)
@@ -6477,140 +6159,28 @@ end
 
 function waf_access(r)
     local uri = r.uri or "/"
-    local method = string.upper(r.method or "GET")
-    if waf_on == 1 then
-    local matched = nil
-    for _, rule in ipairs(rules) do
-        for _, path in ipairs(rule.paths or {}) do
-            if mask_match(path.mask, uri) then
-                matched = {rule = rule, path = path}
-                break
-            end
-        end
-        if matched then
+    local skip_admin = (uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html")
+    if skip_admin or #admin_paths == 0 then
+        return apache2.OK
+    end
+    local is_admin = false
+    for _, mask in ipairs(admin_paths) do
+        if mask_match(mask, uri) then
+            is_admin = true
             break
         end
     end
-    if not matched then
-        r.status = 403
-        return 403
+    if not is_admin then
+        return apache2.OK
     end
-    local path = matched.path
-    if too_long(uri, path.max_length) or not any_type(path.validators, uri) then
-        r.status = 403
-        return 403
+    local ip = request_ip(r)
+    local uid = request_user_id(r)
+    if list_has(admin_ips, ip) or list_has(admin_users, uid) then
+        return apache2.OK
     end
-    local is_post = (method == "POST")
-    local is_get = (method == "GET" or method == "HEAD")
-    if is_post then
-        if path.allow_post ~= 1 then
-            r.status = 403
-            return 403
-        end
-    elseif is_get then
-        if path.allow_get ~= 1 then
-            r.status = 403
-            return 403
-        end
-    else
-        r.status = 403
-        return 403
-    end
-    local params = matched.rule.params or {}
-    local args = {}
-    if r.parseargs then
-        args = r:parseargs() or {}
-    end
-    if not check_fields(params, args, false) then
-        r.status = 403
-        return 403
-    end
-    if is_post then
-        local length = 0
-        if r.headers_in then
-            length = tonumber(r.headers_in["Content-Length"] or "0") or 0
-        end
-        if length > 8388608 then
-            r.status = 403
-            return 403
-        end
-        local body = ""
-        if r.requestbody then
-            local ok, got = pcall(function() return r:requestbody() end)
-            if ok and type(got) == "string" then
-                body = got
-            end
-        end
-        if #body > 8388608 then
-            r.status = 403
-            return 403
-        end
-        if not file_ok(params, body) then
-            r.status = 403
-            return 403
-        end
-        local ctype = ""
-        if r.headers_in then
-            ctype = string.lower(r.headers_in["Content-Type"] or "")
-        end
-        if ctype:find("application/x-www-form-urlencoded", 1, true) and body ~= "" then
-            local function url_decode(text)
-                text = text:gsub("+", " ")
-                text = text:gsub("%%(%x%x)", function(hex)
-                    return string.char(tonumber(hex, 16))
-                end)
-                return text
-            end
-            local post = {}
-            for pair in body:gmatch("[^&]+") do
-                local key, val = pair:match("^([^=]*)=?(.*)$")
-                key = url_decode(key or "")
-                val = url_decode(val or "")
-                post[key] = val
-            end
-            if not check_fields(params, post, true) then
-                r.status = 403
-                return 403
-            end
-        elseif body ~= "" then
-            local star = find_param(params, "*")
-            if star and star.post == 1 then
-                local kinds = {}
-                for _, kind in ipairs(star.validators or {}) do
-                    kinds[#kinds + 1] = kind
-                end
-                for _, kind in ipairs(star.body_types or {}) do
-                    kinds[#kinds + 1] = kind
-                end
-                if too_long(body, star.max_length) or not any_type(kinds, body) then
-                    r.status = 403
-                    return 403
-                end
-            end
-        end
-    end
-    end
-    local skip_admin = (uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html")
-    local is_admin = false
-    if not skip_admin then
-        for _, mask in ipairs(admin_paths) do
-            if mask_match(mask, uri) then
-                is_admin = true
-                break
-            end
-        end
-    end
-    if is_admin then
-        local ip = request_ip(r)
-        local uid = request_user_id(r)
-        if not list_has(admin_ips, ip) and not list_has(admin_users, uid) then
-            return show_verification(r)
-        end
-    end
-    return apache2.OK
+    return show_verification(r)
 end
 LUA;
-
 $out = '/opt/killbot/lua/' . $domain . '-waf.lua';
 $tmp = $out . '.tmp';
 if (file_put_contents($tmp, $lua) === false) {
@@ -6662,7 +6232,7 @@ if (!\$type) {
 }
 
 if (\$type=="v"){
-    echo "3.77"; 
+    echo "3.78"; 
     exit;
 }
 
