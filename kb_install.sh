@@ -1318,6 +1318,29 @@ if ! grep -qE '^[[:space:]]*ListenBacklog[[:space:]]' "$CONFIG_FILE"; then
 fi
 kb_apache_restart
 
+# true: replace X-Real-IP and X-Forwarded-For with the connecting address.
+# false: append that address to X-Forwarded-For and keep a client X-Real-IP.
+kb_overwrite_forwarded_ip=1
+if [ -f /opt/killbot/settings.php ]; then
+    kb_fwd="$(php -d display_errors=0 -r 'include "/opt/killbot/settings.php"; if (!isset($kb_overwrite_forwarded_ip)) { echo "1"; } else { echo empty($kb_overwrite_forwarded_ip) ? "0" : "1"; }' 2>/dev/null || echo 1)"
+    kb_fwd="${kb_fwd//$'\r'/}"
+    kb_fwd="${kb_fwd##*$'\n'}"
+    if [ "$kb_fwd" = "0" ]; then
+        kb_overwrite_forwarded_ip=0
+    fi
+fi
+if [ "$kb_overwrite_forwarded_ip" = "1" ]; then
+    KB_NGINX_IP_HEADERS='        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;'
+else
+    KB_NGINX_IP_HEADERS='        set $kb_x_real_ip $http_x_real_ip;
+        if ($kb_x_real_ip = "") {
+            set $kb_x_real_ip $remote_addr;
+        }
+        proxy_set_header X-Real-IP $kb_x_real_ip;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
+fi
+
 sudo sudo tee /etc/nginx/sites-available/$CURRENT_SERVER_IP.conf > /dev/null <<EOF
 server {
     listen 80;
@@ -1362,8 +1385,7 @@ server {
 
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
-      #  proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+${KB_NGINX_IP_HEADERS}
     }
 }
 server {
@@ -1394,7 +1416,7 @@ server {
 
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+${KB_NGINX_IP_HEADERS}
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
@@ -1472,8 +1494,7 @@ server {
 
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
-       # proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+${KB_NGINX_IP_HEADERS}
 
         # For all remaining junk
         #return 444;
@@ -1533,8 +1554,7 @@ server {
 
         proxy_pass https://127.0.0.1:8443;
         proxy_set_header Host \$host;
-        #proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+${KB_NGINX_IP_HEADERS}
         #proxy_set_header X-Forwarded-Proto \$scheme;
         #proxy_set_header X-Forwarded-Host \$host;
         #proxy_set_header X-Forwarded-Port \$server_port;
@@ -1915,6 +1935,12 @@ $kb_inline_cn_js = false;
 // Rewrite /opt/killbot/killbot_revers (shared backend list) on kb_install.sh.
 // true = replace with the installer default list. false = keep the current file.
 $rewrite_killbot_revers_on_install = true;
+
+// true: nginx writes X-Real-IP and X-Forwarded-For from the connecting address
+// and ignores the values sent by the client.
+// false: append the connecting address to X-Forwarded-For. Keep X-Real-IP when
+// the client sent it, otherwise set X-Real-IP from the connecting address.
+$kb_overwrite_forwarded_ip = true;
 EOF
     echo "Created /opt/killbot/settings.php"
 else
@@ -1937,6 +1963,17 @@ cat >> /opt/killbot/settings.php <<'EOF'
 $rewrite_killbot_revers_on_install = true;
 EOF
     echo "Added rewrite_killbot_revers_on_install to /opt/killbot/settings.php"
+fi
+if [ -f /opt/killbot/settings.php ] && ! grep -q 'kb_overwrite_forwarded_ip' /opt/killbot/settings.php; then
+cat >> /opt/killbot/settings.php <<'EOF'
+
+// true: nginx writes X-Real-IP and X-Forwarded-For from the connecting address
+// and ignores the values sent by the client.
+// false: append the connecting address to X-Forwarded-For. Keep X-Real-IP when
+// the client sent it, otherwise set X-Real-IP from the connecting address.
+$kb_overwrite_forwarded_ip = true;
+EOF
+    echo "Added kb_overwrite_forwarded_ip to /opt/killbot/settings.php"
 fi
 chown root:root /opt/killbot/settings.php
 chmod 644 /opt/killbot/settings.php
@@ -3198,6 +3235,27 @@ if [ -f /etc/nginx/snippets/killbot.conf ]; then
     KB_SOLVER_SNIPPET="    include /etc/nginx/snippets/killbot.conf;"
 fi
 
+kb_overwrite_forwarded_ip=1
+if [ -f /opt/killbot/settings.php ]; then
+    kb_fwd="\$(php -d display_errors=0 -r 'include "/opt/killbot/settings.php"; if (!isset(\$kb_overwrite_forwarded_ip)) { echo "1"; } else { echo empty(\$kb_overwrite_forwarded_ip) ? "0" : "1"; }' 2>/dev/null || echo 1)"
+    kb_fwd="\${kb_fwd//\$'\r'/}"
+    kb_fwd="\${kb_fwd##*\$'\n'}"
+    if [ "\$kb_fwd" = "0" ]; then
+        kb_overwrite_forwarded_ip=0
+    fi
+fi
+if [ "\$kb_overwrite_forwarded_ip" = "1" ]; then
+    KB_NGINX_IP_HEADERS='        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;'
+else
+    KB_NGINX_IP_HEADERS='        set \$kb_x_real_ip \$http_x_real_ip;
+        if (\$kb_x_real_ip = "") {
+            set \$kb_x_real_ip \$remote_addr;
+        }
+        proxy_set_header X-Real-IP \$kb_x_real_ip;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;'
+fi
+
 nginXConfigFile="/etc/nginx/sites-available/\$domain.conf"
 
 nginXconfigContent="server {
@@ -3312,8 +3370,7 @@ nginXconfigContent+="proxy_http_version 1.1;
 
         proxy_pass https://127.0.0.1:8443;
         proxy_set_header Host \\\$host;
-        #proxy_set_header X-Real-IP \\\$remote_addr;
-        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+\${KB_NGINX_IP_HEADERS}
         #proxy_set_header X-Forwarded-Proto \\\$scheme;
         #proxy_set_header X-Forwarded-Host \\\$host;
         #proxy_set_header X-Forwarded-Port \\\$server_port;
@@ -3626,8 +3683,7 @@ server {
 
         proxy_pass https://127.0.0.1:8443;
         proxy_set_header Host \\\$host;
-        #proxy_set_header X-Real-IP \\\$remote_addr;
-        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+\${KB_NGINX_IP_HEADERS}
         #proxy_set_header X-Forwarded-Proto \\\$scheme;
         #proxy_set_header X-Forwarded-Host \\\$host;
         #proxy_set_header X-Forwarded-Port \\\$server_port;
