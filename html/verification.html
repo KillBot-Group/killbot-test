@@ -971,6 +971,7 @@ var kbYandexMetrika="";
 var kbYandexMetrikaInitAllow="1";
 var kbTimeout=0;
 var kbSliderTimeout=5000;
+var kbDataReceivedWait=6000;
 var kbCounterNotLoadedIsBot="1";
 var kbCutCounterIsBot="1";
 var kbMetrikaDisableForBots="0";  
@@ -2639,7 +2640,7 @@ function kbFireDataReceived(){
                                 })
         });
         document.dispatchEvent(event);
-    }, 2 * kbSliderTimeout+5000);
+    }, kbDataReceivedWait);
 }
 
 function kbOnDataReceived(event) {
@@ -3160,6 +3161,7 @@ $names = array('ptLtpk',
     'kbYandexMetrikaInitAllow',
     'kbTimeout',
     'kbSliderTimeout',
+    'kbDataReceivedWait',
     'kbCounterNotLoadedIsBot',
     'kbCutCounterIsBot',
     'kbMetrikaDisableForBots',

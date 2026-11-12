@@ -716,6 +716,10 @@ sudo a2enmod proxy_http
 sudo a2enmod headers
 sudo a2enmod remoteip
 sudo a2enmod setenvif
+if [ -d /var/log/apache2 ]; then
+    sudo chgrp www-data /var/log/apache2 2>/dev/null || true
+    sudo chmod 2775 /var/log/apache2 2>/dev/null || true
+fi
 sudo tee /etc/apache2/conf-available/killbot-logformat.conf > /dev/null <<'EOF'
 # combined + kbRes kbUserID kbSession kbCheck (NONE if the cookie is missing)
 SetEnvIf Request_URI "^" KB_LOG_KBRES=NONE
@@ -2635,6 +2639,127 @@ local function is_ip_in_allowed_url(ip, host)
     return false
 end
 
+local function log_escape(value)
+    value = tostring(value or "")
+    value = value:gsub("[\r\n]", " ")
+    value = value:gsub("\\", "\\\\")
+    value = value:gsub('"', '\\"')
+    return value
+end
+
+local function is_clean_page(uri)
+    local path = tostring(uri or "/")
+    local cut = path:find("?", 1, true)
+    if cut then
+        path = path:sub(1, cut - 1)
+    end
+    if path == "" or path == "/" then
+        return true
+    end
+    local base = path:match("([^/]+)$") or ""
+    if base == "" or not base:find(".", 1, true) then
+        return true
+    end
+    local ext = base:match("%.([^.]+)$")
+    if not ext or ext == "" then
+        return true
+    end
+    ext = ext:lower()
+    return ext == "html" or ext == "htm" or ext == "php" or ext == "phtml" or ext == "asp" or ext == "aspx" or ext == "jsp"
+end
+
+local function apache_stamp()
+    local months = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+    local t = os.date("*t")
+    local zone = os.date("%z")
+    if not zone or zone == "" then
+        zone = "+0000"
+    end
+    return string.format("[%02d/%s/%04d:%02d:%02d:%02d %s]", t.day, months[t.month] or "Jan", t.year, t.hour, t.min, t.sec, zone)
+end
+
+local function cookie_get(r, name)
+    local cookie = ""
+    if r.headers_in then
+        cookie = r.headers_in["Cookie"] or ""
+    end
+    local value = cookie:match(name .. "=([^;]*)")
+    if not value or value == "" then
+        return "-"
+    end
+    value = value:gsub("[\r\n\"]", "")
+    if #value > 200 then
+        value = value:sub(1, 200)
+    end
+    return value
+end
+
+local function access_line(r, tail)
+    local ip = ""
+    if r.subprocess_env then
+        ip = r.subprocess_env["REAL_REMOTE_ADDR"] or ""
+    end
+    if ip == "" and r.useragent_ip then
+        ip = r.useragent_ip
+    end
+    if ip == "" then
+        ip = "-"
+    end
+    local method = r.method or "GET"
+    local uri = r.unparsed_uri or r.uri or "/"
+    local proto = r.protocol or "HTTP/1.1"
+    local referer = "-"
+    local ua = "-"
+    if r.headers_in then
+        referer = r.headers_in["Referer"] or "-"
+        ua = r.headers_in["User-Agent"] or "-"
+    end
+    if referer == "" then
+        referer = "-"
+    end
+    if ua == "" then
+        ua = "-"
+    end
+    return ip .. " - - " .. apache_stamp()
+        .. ' "' .. log_escape(method .. " " .. uri .. " " .. proto) .. '" - - "'
+        .. log_escape(referer) .. '" "' .. log_escape(ua) .. '" ' .. tail
+end
+
+local function append_access_log(path, line)
+    local f = io.open(path, "a")
+    if not f then
+        return
+    end
+    f:write(line .. "\n")
+    f:close()
+end
+
+local function should_log_visit(r)
+    local uri = r.uri or "/"
+    if uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html" then
+        return false
+    end
+    return is_clean_page(uri)
+end
+
+local function log_verified(r)
+    if not should_log_visit(r) then
+        return
+    end
+    local tail = "kbRes=" .. cookie_get(r, "kbRes")
+        .. " kbUserID=" .. cookie_get(r, "kbUserID")
+        .. " kbSession=" .. cookie_get(r, "kbSession")
+        .. " kbCheck=" .. cookie_get(r, "kbCheck")
+    append_access_log("/var/log/apache2/kb_domain.verified.access.log", access_line(r, tail))
+end
+
+local function log_passed(r, reason)
+    if not should_log_visit(r) then
+        return
+    end
+    append_access_log("/var/log/apache2/kb_domain.passed.access.log", access_line(r, '"' .. log_escape(reason) .. '"'))
+end
+
 function handle(r)
     local user_agent = r.headers_in["User-Agent"] or ""
     local remote_addr = r.subprocess_env["REAL_REMOTE_ADDR"] or ""
@@ -2667,6 +2792,7 @@ function handle(r)
     end
 
     if is_ip_in_allowed_url(remote_addr, http_host) then
+        log_passed(r, "пропуск: IP в сгенерированном списке официальных сетей")
         return apache2.DECLINED
     end
 
@@ -2745,11 +2871,13 @@ end
 
     if ip_allowed(remote_addr_org) then
         log_message("ip:"  .. remote_addr_org .. " ip_allowed: " .. remote_addr_org .. " DECLINED",http_host)
+        log_passed(r, "пропуск: IP в разрешённых IP")
         return apache2.DECLINED
     end
 
     if path_allowed(r.unparsed_uri) then
         log_message("ip:"  .. remote_addr_org .. " path_allowed: " .. r.unparsed_uri .. " DECLINED",http_host)
+        log_passed(r, "пропуск: путь в разрешённых путях")
         return apache2.DECLINED
     end
 
@@ -2779,6 +2907,11 @@ end
 
     if agent_allowed(user_agent) then
         log_message("ip:"  .. remote_addr_org .. " trusted user agent detected : " .. user_agent .. " DECLINED",http_host)
+        if is_real_bot == "bot_true" then
+            log_passed(r, "пропуск: обратный DNS совпал с user agent бота")
+        else
+            log_passed(r, "пропуск: user agent в списке разрешённых")
+        end
         return apache2.DECLINED
     end
 
@@ -2833,6 +2966,7 @@ end
     if computed_hash == expected_hash then
         r.subprocess_env["KBCHECK_MUST_BE"] = "true"
         log_message("ip:"  .. remote_addr_org .. " cached computed_hash == expected_hash: '" .. computed_hash .. "' DECLINED",http_host)
+        log_verified(r)
         return apache2.DECLINED
     end
 
@@ -2846,6 +2980,7 @@ end
     if computed_hash == expected_hash then
         r.subprocess_env["KBCHECK_MUST_BE"] = "true"
         log_message("ip:"  .. remote_addr_org .. " computed computed_hash == expected_hash: " .. computed_hash .. " DECLINED",http_host)
+        log_verified(r)
         return apache2.DECLINED
     else
 --        if line2 then computed_hash = modifyMd5(line2) end
@@ -2853,6 +2988,7 @@ end
         if computed_hash == expected_hash then
             r.subprocess_env["KBCHECK_MUST_BE"] = "true"
             log_message("ip:"  .. remote_addr_org .. " computed computed_hash == expected_hash: " .. computed_hash .. " DECLINED",http_host)
+            log_verified(r)
             return apache2.DECLINED
         else    
             local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
@@ -5373,6 +5509,18 @@ lua_script2_sed="\$(kb_sed_repl "\$lua_script2")"
 domain_sed="\$(kb_sed_repl "\$domain_without_www")"
 sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_script|\${lua_script_sed}|g" -e "s|kb2_lua_script|\${lua_script2_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" -e "s|kb_lua_paths|\${lua_paths_sed}|g" -e "s|kb_lua_ips|\${lua_ips_sed}|g" /opt/killbot/kb.lua > /opt/killbot/lua/\$domain_without_www.lua
 
+kb_prepare_visit_log() {
+    local f="\$1"
+    sudo mkdir -p /var/log/apache2
+    if [ ! -e "\$f" ]; then
+        sudo touch "\$f" || return 0
+    fi
+    sudo chown www-data:adm "\$f" 2>/dev/null || sudo chown www-data:www-data "\$f" || true
+    sudo chmod 640 "\$f" || true
+}
+kb_prepare_visit_log "/var/log/apache2/\${domain_without_www}.verified.access.log"
+kb_prepare_visit_log "/var/log/apache2/\${domain_without_www}.passed.access.log"
+
 
 
 #sudo chown -R www-data:www-data /opt/killbot/php/\$domain_without_www.php
@@ -6733,7 +6881,17 @@ if (\$type == "access_log") {
         echo "invalid domain";
         exit;
     }
-    \$log_file = "/var/log/apache2/" . \$log_domain . ".access.log";
+    \$log_kind = isset(\$_GET["log"]) ? (string) \$_GET["log"] : "";
+    \$log_suffix = ".access.log";
+    if (\$log_kind === "verified") {
+        \$log_suffix = ".verified.access.log";
+    } elseif (\$log_kind === "passed") {
+        \$log_suffix = ".passed.access.log";
+    } elseif (\$log_kind !== "") {
+        echo "invalid log";
+        exit;
+    }
+    \$log_file = "/var/log/apache2/" . \$log_domain . \$log_suffix;
     if (!is_file(\$log_file) || !is_readable(\$log_file)) {
         echo "no log";
         exit;

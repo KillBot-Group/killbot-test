@@ -1,7 +1,7 @@
 <?php
 
-// Inline cn.js shipped next to verification.php.
-// No solver files, no BF, no counter database. The HTTP /js/cn.js endpoint stays the solver script.
+// Included from verification.php only. Same client script as solver cn.js,
+// without the solver host, CORS endpoint, database, or counter.
 
 error_reporting(E_ALL ^ E_DEPRECATED);
 ini_set("display_errors", "Off");
@@ -23,30 +23,6 @@ if (!function_exists('kb_cn_js_stop')) {
     }
 }
 
-//    http_response_code(500);
-//exit;
-
-if (!KB_CN_JS_EMBEDDED) {
-    set_time_limit(3);
-
-    // Регистрируем функцию, которая выполнится при завершении скрипта (в т.ч. при таймауте)
-    register_shutdown_function(function() {
-        $error = error_get_last();
-        if ($error && $error['type'] === E_ERROR && strpos($error['message'], 'Maximum execution time') !== false) {
-            http_response_code(500);
-            error_log("Killbot cn.js timeout: ".$error['message']);
-            exit;
-        }
-    });
-}
-
-//exit;
-
-//$blockedWords = ['kachkoff','doctorguber','lordseria','home-heat.ru'];
-//$blockedWords = ['kachkoff','doctorguber','lordseria','home-heat.ru','readli.net','bayersdesign.ru'];
-//$blockedWords = ['home-heat.ru'];
-$blockedWords = ['kachkoff'];
-
 // Получить реферер
 $referer = $_SERVER['HTTP_REFERER'] ?? '';
 
@@ -55,269 +31,9 @@ if (stripos($referer,"seomastering.com")!==false){
     $exit_on_port = true;
 }
 
-/*
-
-if (stripos($referer,"readli.net")!==false){
-    http_response_code(500);
-    return;
-}
-
-if (stripos($referer,"bayersdesign.ru")!==false){
-    http_response_code(500);
-    return;
-}
-*/
-/*
-if (rand(0,100)<50){
-    http_response_code(500);
-    return;
-}
-
-
-if (stripos($referer,"readli.net")!==false){
-    http_response_code(500);
-    return;
-}
-
-if (stripos($referer,"bayersdesign.ru")!==false){
-    http_response_code(500);
-    return;
-}
-
-
-if (rand(0,100)<50){
-    http_response_code(500);
-    return;
-}
-*/
-
-// Проверить реферер на наличие запрещённых слов
-foreach ($blockedWords as $word) {
-    if (stripos($referer, $word) !== false) {
-        // Если слово найдено, прервать выполнение скрипта
-        kb_cn_js_stop();
-    }
-}
-
 $js_content_len=0;
 if (isset($_GET['lv'])){
     $js_content_len=$_GET['lv'];
-}
-
-$test = isset($_GET['test'])?1:0;
-
-if ($test) {
-echo "ok"; kb_cn_js_stop();
-}
-
-
-//$HOST = "https://data.killbot.ru";
-//$HOST = "https://data.kill-bot.net";
-//$HOST = "http://65.108.20.41/data.killbot.ru";
-/*
-$HOST = "https://" . (isset($_SERVER['HTTP_X_FORWARDED_HOST']) 
-    ? $_SERVER['HTTP_X_FORWARDED_HOST'] 
-    : ($_SERVER['HTTP_HOST'] ?? ''));
-*/
-
-if (isset($_GET['test'])){
-    kb_cn_js_stop();
-}
-
-// Local copies of the few kb_settings helpers this script prints into JS.
-// Do not load /var/www/html/solver or solver_tools.
-if (!function_exists('kb_js')) {
-    function kb_js($value) {
-        $json = json_encode(
-            $value,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
-        );
-        if ($json === false) {
-            return '""';
-        }
-        return $json;
-    }
-}
-
-if (!function_exists('kb_request_html_ts')) {
-    function kb_request_html_ts($value = null) {
-        if ($value === null) {
-            $value = isset($_GET['png']) ? $_GET['png'] : 0;
-        }
-        if (is_string($value) && $value !== '' && ctype_digit($value)) {
-            return (int) $value;
-        }
-        if (is_int($value) || is_float($value)) {
-            $n = (int) $value;
-            return ($n > 0) ? $n : 0;
-        }
-        return 0;
-    }
-}
-
-if (!function_exists('kb_cn_inline_host')) {
-    function kb_cn_inline_host($value) {
-        $host = strtolower(trim((string) $value));
-        if ($host === '') {
-            return '';
-        }
-        $host = preg_replace('/^https?:\/\//i', '', $host);
-        $slash = strpos($host, '/');
-        if ($slash !== false) {
-            $host = substr($host, 0, $slash);
-        }
-        $comma = strpos($host, ',');
-        if ($comma !== false) {
-            $host = substr($host, 0, $comma);
-        }
-        $host = trim($host);
-        if ($host === '' || !preg_match('/^[a-z0-9.-]+(?::[0-9]{1,5})?$/', $host)) {
-            return '';
-        }
-        return $host;
-    }
-}
-
-if (!function_exists('kb_request_host')) {
-    function kb_request_host() {
-        if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
-            $parts = explode(',', (string) $_SERVER['HTTP_X_FORWARDED_HOST']);
-            $host = kb_cn_inline_host($parts[0]);
-            if ($host !== '') {
-                return $host;
-            }
-        }
-        return kb_cn_inline_host(isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '');
-    }
-}
-
-if (!function_exists('kb_js_callback_origin')) {
-    function kb_js_callback_origin() {
-        $host = kb_request_host();
-        if ($host !== '') {
-            return 'https://' . $host;
-        }
-        if (!empty($_GET['srv'])) {
-            $srv = trim((string) $_GET['srv']);
-            if (preg_match('#^(https?)://([a-z0-9.-]+(?::[0-9]{1,5})?)(?:/|$)#i', $srv, $m)) {
-                return strtolower($m[1]) . '://' . strtolower($m[2]);
-            }
-        }
-        return '';
-    }
-}
-
-if (!function_exists('kb_send_cors_headers')) {
-    function kb_send_cors_headers($extra_headers = array()) {
-        header('Access-Control-Allow-Origin: *');
-        if (is_array($extra_headers)) {
-            foreach ($extra_headers as $header) {
-                header($header);
-            }
-        }
-    }
-}
-
-function getOriginalHost() {
-    return kb_request_host();
-}
-
-$HOST = kb_js_callback_origin();
-if ($HOST === '') {
-    $HOST = "https://" . getOriginalHost();
-}
-
-error_reporting(E_ALL ^ E_DEPRECATED);
-ini_set("display_errors", "Off");
-
-if (!KB_CN_JS_EMBEDDED) {
-    kb_send_cors_headers();
-    //header('Access-Control-Allow-Credentials',true);
-    //header('Access-Control-Allow-Methods', 'GET');
-
-    if (!function_exists('kb_cn_http_origin')) {
-        function kb_cn_http_origin($value) {
-            $value = trim((string) $value);
-            if ($value === '') {
-                return '';
-            }
-            if (strpos($value, '://') === false) {
-                $value = 'https://' . ltrim($value, '/');
-            }
-            $p = parse_url($value);
-            if (!is_array($p) || empty($p['scheme']) || empty($p['host'])) {
-                return '';
-            }
-            $scheme = strtolower((string) $p['scheme']);
-            if ($scheme !== 'http' && $scheme !== 'https') {
-                return '';
-            }
-            $host = strtolower((string) $p['host']);
-            if (!preg_match('/^[a-z0-9.-]+$/', $host)) {
-                return '';
-            }
-            $origin = $scheme . '://' . $host;
-            if (!empty($p['port'])) {
-                $origin .= ':' . (int) $p['port'];
-            }
-            return $origin;
-        }
-    }
-    if (!function_exists('kb_cn_b64_url')) {
-        function kb_cn_b64_url($value) {
-            $value = trim((string) $value);
-            if ($value === '') {
-                return '';
-            }
-            $decoded = base64_decode(strtr($value, '-_', '+/'), true);
-            if (!is_string($decoded) || $decoded === '') {
-                $decoded = base64_decode($value);
-            }
-            return is_string($decoded) ? $decoded : '';
-        }
-    }
-
-    $kb_cn_origin = kb_cn_http_origin(isset($_SERVER['HTTP_ORIGIN']) ? $_SERVER['HTTP_ORIGIN'] : '');
-    $kb_cn_ref_origin = kb_cn_http_origin(isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '');
-    $kb_cn_page_origin = kb_cn_http_origin(isset($_GET['srv']) ? $_GET['srv'] : '');
-    if ($kb_cn_page_origin === '') {
-        $kb_cn_page_origin = kb_cn_http_origin(kb_cn_b64_url(isset($_GET['url']) ? $_GET['url'] : ''));
-    }
-    if ($kb_cn_ref_origin === '') {
-        $kb_cn_ref_origin = $kb_cn_page_origin;
-    }
-    if ($kb_cn_ref_origin === '') {
-        $kb_cn_ref_origin = kb_cn_http_origin(kb_cn_b64_url(isset($_GET['r']) ? $_GET['r'] : ''));
-    }
-    $kb_cn_req_host = strtolower(preg_replace('/:\d+$/', '', kb_request_host()));
-    $kb_cn_allow = '';
-    $kb_cn_origin_host = ($kb_cn_origin !== '') ? parse_url($kb_cn_origin, PHP_URL_HOST) : false;
-    if ($kb_cn_origin !== '') {
-        $kb_cn_same_ref = ($kb_cn_ref_origin !== '' && strcasecmp($kb_cn_origin, $kb_cn_ref_origin) === 0);
-        $kb_cn_same_page = ($kb_cn_page_origin !== '' && strcasecmp($kb_cn_origin, $kb_cn_page_origin) === 0);
-        $kb_cn_same_req = (
-            is_string($kb_cn_origin_host) && $kb_cn_origin_host !== '' &&
-            $kb_cn_req_host !== '' &&
-            strcasecmp($kb_cn_origin_host, $kb_cn_req_host) === 0
-        );
-        if ($kb_cn_same_ref || $kb_cn_same_page || $kb_cn_same_req) {
-            $kb_cn_allow = $kb_cn_origin;
-        }
-    }
-    if ($kb_cn_allow === '' && $kb_cn_ref_origin !== '') {
-        $kb_cn_allow = $kb_cn_ref_origin;
-    }
-    if ($kb_cn_allow !== '') {
-        header('Access-Control-Allow-Origin: ' . $kb_cn_allow);
-        header('Vary: Origin');
-    }
-
-    header('Content-Type: application/javascript');
-
-    if (isset($_SERVER['REQUEST_METHOD']) && strtoupper((string) $_SERVER['REQUEST_METHOD']) === 'OPTIONS') {
-        http_response_code(204);
-        exit;
-    }
 }
 
 if (!isset($_GET["c"])||!$_GET["c"]) return;
@@ -329,26 +45,6 @@ $pl_js = isset($_GET['pl_js']) && ($_GET['pl_js'] === '1' || $_GET['pl_js'] === 
 
 //$counter_id=$_GET["id"];
 $session_cookie = $_GET["c"];
-$kbUserID = isset($_GET["kbUserID"])?$_GET["kbUserID"]:0;
-
-if ($session_cookie==75030592){
-//    exit;
-}
-
-
-if ($session_cookie == 1) kb_cn_js_stop();
-
-// unset cookies
-if (!KB_CN_JS_EMBEDDED && isset($_SERVER['HTTP_COOKIE'])) {
-    $cookies = explode(';', $_SERVER['HTTP_COOKIE']);
-    foreach($cookies as $cookie) {
-        $parts = explode('=', $cookie);
-        $name = trim($parts[0]);
-	if (!$name) continue;
-        setcookie($name, '', time()-1000);
-        setcookie($name, '', time()-1000, '/');
-    }
-}
 
 $output = array();
 $output_u = array();
@@ -402,14 +98,7 @@ $hash_str = "";
 if (isset($output["hash_str"])){
     $hash_str = $output["hash_str"];
 }
-/*
-if (!$hash_str){
-echo "no hash str!";
-    exit;
-}
-*/
 
-//echo "ok".$hash_str; exit;
 
 $permanent_cookie = null;
 
@@ -417,19 +106,23 @@ error_reporting(E_ALL ^ E_DEPRECATED);
 ini_set("display_errors", "Off");
 
 $serverTimeUTC = round(microtime(true) * 1000);
-$page_ts = kb_request_html_ts();
-if ($page_ts <= 0) {
-    $page_ts = (int) $serverTimeUTC;
+$page_ts = (int) $serverTimeUTC;
+if (isset($_GET['png']) && ctype_digit((string) $_GET['png']) && (int) $_GET['png'] > 0) {
+    $page_ts = (int) $_GET['png'];
 }
 
-$js_host = kb_js($HOST);
-if (!empty($pl_js)) {
-    $js_host = '(kbServerURL||'.$js_host.')';
-}
-$js_c = kb_js($session_cookie);
-$js_url = kb_js(isset($_GET['url']) ? (string) $_GET['url'] : '');
-$js_r = kb_js(isset($_GET['r']) ? (string) $_GET['r'] : '');
-$js_lv = kb_js($js_content_len);
+$kb_cn_lit = function ($value) {
+    $json = json_encode(
+        $value,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+    );
+    return ($json === false) ? '""' : $json;
+};
+$js_host = 'kbServerURL';
+$js_c = $kb_cn_lit($session_cookie);
+$js_url = $kb_cn_lit(isset($_GET['url']) ? (string) $_GET['url'] : '');
+$js_r = $kb_cn_lit(isset($_GET['r']) ? (string) $_GET['r'] : '');
+$js_lv = $kb_cn_lit($js_content_len);
 $js_extra_q = $pl_js ? '+"&pl_js=1&hash_str=dns"' : '';
 
 
