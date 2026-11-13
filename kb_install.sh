@@ -4776,7 +4776,7 @@ declare cdn_static=""
 declare https="https"
 declare cv_b64=""
 declare admin_mode=""
-declare admin_file=""
+declare admin_b64=""
 
 DNS_SERVERS=("77.88.8.8" "8.8.8.8")  # yandex, Google
 RANDOM_INDEX=\$(( \${#DNS_SERVERS[@]} > 0 ? RANDOM % \${#DNS_SERVERS[@]} : 0 ))
@@ -4974,18 +4974,12 @@ kb_apply_admin_apache() {
         echo "Invalid domain." >&2
         return 1
     fi
-    if [[ -n "\$admin_file" ]]; then
-        case "\$admin_file" in
-            /tmp/*|/var/tmp/*) ;;
-            *) echo "ERROR: bad admin file" >&2; return 1 ;;
-        esac
-        if [[ ! -f "\$admin_file" ]]; then
-            echo "ERROR: admin file missing" >&2
+    if [[ -n "\$admin_b64" ]]; then
+        if [[ "\${#admin_b64}" -gt 1048576 ]] || [[ ! "\$admin_b64" =~ ^[A-Za-z0-9+/=]+\$ ]]; then
+            echo "ERROR: bad admin data" >&2
             return 1
         fi
-        /opt/killbot/sh/waf_http_data.sh "\$d" < "\$admin_file" || rc=\$?
-        rm -f "\$admin_file"
-        admin_file=""
+        /opt/killbot/sh/waf_http_data.sh "\$d" "\$admin_b64" || rc=\$?
         if [[ "\$rc" -ne 0 ]]; then
             echo "ERROR: waf lua write failed" >&2
             return 1
@@ -5041,8 +5035,8 @@ while [[ "\$#" -gt 0 ]]; do
             cv_b64="\$2"; shift 2;;
         -admin)
             admin_mode="\$2"; shift 2;;
-        -adminfile)
-            admin_file="\$2"; shift 2;;
+        -admindata)
+            admin_b64="\$2"; shift 2;;
         *)
             trimmed="\$(echo -n "\$1" | xargs)"
             [[ -n "\$trimmed" ]] && { echo "Unknown arg: '\$1'"; exit 1; } || shift 1
@@ -5050,7 +5044,7 @@ while [[ "\$#" -gt 0 ]]; do
     esac
 done
 
-if [[ -n "\$admin_mode" || -n "\$admin_file" ]]; then
+if [[ -n "\$admin_mode" || -n "\$admin_b64" ]]; then
     if [[ -z "\$email" && -z "\$token" && -z "\$backend_ip" ]]; then
         kb_apply_admin_apache
         exit \$?
@@ -5641,6 +5635,21 @@ kb_sed_repl() {
     printf '%s' "\$s"
 }
 
+# Replace text in an existing file without a temporary file next to it.
+# sed -i creates sedXXXXXX in the same directory, which fails when that
+# directory cannot take a new file even if the target file can be rewritten.
+kb_sed_file() {
+    local file="\$1"
+    shift
+    local body
+    if [ ! -f "\$file" ]; then
+        echo "missing \$file" >&2
+        return 1
+    fi
+    body=\$(sed "\$@" "\$file") || return 1
+    printf '%s\n' "\$body" > "\$file"
+}
+
 #Updating kb.lua
 lua_paths_sed="\$(kb_sed_repl "\$lua_paths")"
 lua_agents_sed="\$(kb_sed_repl "\$lua_agents")"
@@ -5715,22 +5724,22 @@ fi
 
 # Disable SSL if the domain does not have www
 if [[ "\$ip_without_www_list" == "\$ip_with_www_list" && -n "\$ip_without_www_list" ]]; then
-    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /etc/apache2/sites-available/\$domain_without_www.conf    
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|***www_ssl_on***|SSLEngine on|g"
 else
-    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /etc/apache2/sites-available/\$domain_without_www.conf
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|***www_ssl_on***||g"
 fi
 
 if [ "\$backend_ip" != "localhost" ]; then
     echo "The Apache server for the site \$domain_without_www is configured as a reverse proxy to IP=\$backend_ip"
-    sed -i "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g" /etc/apache2/sites-available/\$domain_without_www-killbot.conf
-    sed -i "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g" /etc/apache2/sites-available/\$domain_without_www.conf
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www-killbot.conf" -e "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g"
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|#Define PROXY_ENABLE|Define PROXY_ENABLE|g"
 else
     echo "The Apache server for the site \$domain_without_www is configured to the localhost directory \$folder"
 fi
 
-sed -i 's|\.access\.log combined\$|.access.log combined_kb|' /etc/apache2/sites-available/\$domain_without_www-killbot.conf
+kb_sed_file "/etc/apache2/sites-available/\$domain_without_www-killbot.conf" -e 's|\.access\.log combined\$|.access.log combined_kb|'
 
-if [[ -n "\$admin_mode" || -n "\$admin_file" ]]; then
+if [[ -n "\$admin_mode" || -n "\$admin_b64" ]]; then
     kb_apply_admin_apache || exit 1
 fi
 
@@ -6242,35 +6251,38 @@ sudo systemctl daemon-reload
 mkdir -p /opt/killbot/sh /opt/killbot/lua
 cat > /opt/killbot/sh/waf_http_data.sh << 'WAF_HTTP_DATA_EOF'
 #!/bin/bash
-# Build /opt/killbot/lua/{domain}-waf.lua from WAF rules.
-# stdin: base64 JSON of rule groups (paths + params).
+# Build /opt/killbot/lua/{domain}-waf.lua the same way kb.lua is written:
+# php prints the lua, the shell redirects it onto the final file.
+# Args: domain base64-json
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-  echo "Usage: $0 domain" >&2
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 domain b64" >&2
   exit 1
 fi
 
 domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+b64=$(printf '%s' "$2" | tr -d '[:space:]')
 if ! printf '%s' "$domain" | grep -Eq '^[a-z0-9.-]+$' || printf '%s' "$domain" | grep -q '\.\.'; then
   echo "invalid domain" >&2
   exit 1
 fi
+if ! printf '%s' "$b64" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
+  echo "bad waf_http_data" >&2
+  exit 1
+fi
 
 mkdir -p /opt/killbot/lua
-b64_file=$(mktemp)
-trap 'rm -f "$b64_file"' EXIT
-cat > "$b64_file"
+out="/opt/killbot/lua/${domain}-waf.lua"
 
-php - "$domain" "$b64_file" << 'PHP'
+lua_body=$(WAF_DOMAIN="$domain" WAF_B64="$b64" php << 'PHP'
 <?php
-$domain = isset($argv[1]) ? strtolower((string) $argv[1]) : '';
-$b64_file = isset($argv[2]) ? (string) $argv[2] : '';
+$domain = strtolower((string) getenv('WAF_DOMAIN'));
+$raw = preg_replace('/\s+/', '', (string) getenv('WAF_B64'));
 if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
     fwrite(STDERR, "invalid domain\n");
     exit(1);
 }
-$raw = preg_replace('/\s+/', '', (string) file_get_contents($b64_file));
 if ($raw === '' || !preg_match('/^[A-Za-z0-9+\/=]+$/', $raw)) {
     fwrite(STDERR, "bad waf_http_data\n");
     exit(1);
@@ -6493,14 +6505,7 @@ if (!$rules_sent && isset($decoded['admin']) && is_file($out)) {
         $old = preg_replace('/^local admin_ips = .*$/m', 'local admin_ips = ' . waf_lua_strings($admin_ips), $old, 1, $c3);
     }
     if ($c1 === 1 && $c2 === 1 && $c3 === 1) {
-        $tmp_keep = $out . '.tmp';
-        if (file_put_contents($tmp_keep, $old) === false || !rename($tmp_keep, $out)) {
-            @unlink($tmp_keep);
-            fwrite(STDERR, "cannot save lua\n");
-            exit(1);
-        }
-        @chmod($out, 0644);
-        echo "Success\n";
+        echo $old;
         exit(0);
     }
 }
@@ -6942,20 +6947,17 @@ function waf_access(r)
 end
 LUA;
 
-$out = '/opt/killbot/lua/' . $domain . '-waf.lua';
-$tmp = $out . '.tmp';
-if (file_put_contents($tmp, $lua) === false) {
-    fwrite(STDERR, "cannot write lua\n");
-    exit(1);
-}
-if (!rename($tmp, $out)) {
-    @unlink($tmp);
-    fwrite(STDERR, "cannot save lua\n");
-    exit(1);
-}
-@chmod($out, 0644);
-echo "Success\n";
+echo $lua;
+exit(0);
 PHP
+)
+if [ -z "$lua_body" ]; then
+  echo "cannot write lua" >&2
+  exit 1
+fi
+printf '%s\n' "$lua_body" > "$out"
+chmod 644 "$out"
+echo Success
 WAF_HTTP_DATA_EOF
 chmod 755 /opt/killbot/sh/waf_http_data.sh
 
@@ -6980,10 +6982,10 @@ if [ "$enable" != "0" ] && [ "$enable" != "1" ]; then
   exit 1
 fi
 
-php - "$domain" "$enable" << 'PHP'
+WAF_DOMAIN="$domain" WAF_ENABLE="$enable" php << 'PHP'
 <?php
-$domain = isset($argv[1]) ? strtolower((string) $argv[1]) : '';
-$enable = (isset($argv[2]) && (string) $argv[2] === '1') ? 1 : 0;
+$domain = strtolower((string) getenv('WAF_DOMAIN'));
+$enable = ((string) getenv('WAF_ENABLE') === '1') ? 1 : 0;
 if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
     fwrite(STDERR, "invalid domain\n");
     exit(1);
@@ -7201,13 +7203,7 @@ if (\$type == "waf_http_data" || \$type == "waf_http_enable") {
             echo "ERROR: bad waf_http_data";
             exit;
         }
-        \$admin_tmp = tempnam(sys_get_temp_dir(), "kbadmin");
-        if (\$admin_tmp === false || file_put_contents(\$admin_tmp, \$raw) === false) {
-            echo "ERROR: cannot store admin data";
-            exit;
-        }
-        @chmod(\$admin_tmp, 0644);
-        \$cmd .= " -adminfile " . escapeshellarg(\$admin_tmp);
+        \$cmd .= " -admindata " . escapeshellarg(\$raw);
     } else {
         \$waf_enable = (isset(\$_GET["enable"]) && (string) \$_GET["enable"] === "1") ? "1" : "0";
         \$cmd .= " -admin " . escapeshellarg(\$waf_enable);
@@ -7481,11 +7477,7 @@ if (\$type == "install"){
         \$command .= " -admin " . escapeshellarg(\$waf_admin_enable);
     }
     if (\$waf_admin_raw !== "" && preg_match('/^[A-Za-z0-9+\/=]+\$/', \$waf_admin_raw)) {
-        \$waf_admin_tmp = tempnam(sys_get_temp_dir(), "kbadmin");
-        if (\$waf_admin_tmp !== false && file_put_contents(\$waf_admin_tmp, \$waf_admin_raw) !== false) {
-            @chmod(\$waf_admin_tmp, 0644);
-            \$command .= " -adminfile " . escapeshellarg(\$waf_admin_tmp);
-        }
+        \$command .= " -admindata " . escapeshellarg(\$waf_admin_raw);
     }
 }
 
