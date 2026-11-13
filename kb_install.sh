@@ -2171,6 +2171,18 @@ if [ ! -f "$FILE" ]; then
     fi
 fi
 
+FILE="/opt/killbot/html/admin_denied.html"
+if [ ! -f "$FILE" ]; then
+    kb_download "$FILE" "html/admin_denied.html"
+
+    if [ $? -eq 0 ]; then
+        echo "admin_denied loaded."
+    else
+        echo "Error loading the admin_denied.html"
+        exit 1
+    fi
+fi
+
 FILE="/opt/killbot/html/too_many_requests.html"
 if [ ! -f "$FILE" ]; then
     kb_download "$FILE" "html/too_many_requests.html"
@@ -2789,7 +2801,7 @@ end
 
 local function should_log_visit(r)
     local uri = r.uri or "/"
-    if uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html" then
+    if uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/admin_denied.html" or uri == "/too_many_requests.html" then
         return false
     end
     return is_clean_page(uri)
@@ -2915,6 +2927,10 @@ end
     end
 
     if r.uri == "/access_denied.html" then
+        return apache2.DECLINED
+    end
+
+    if r.uri == "/admin_denied.html" then
         return apache2.DECLINED
     end
 
@@ -3465,6 +3481,14 @@ configContent="<VirtualHost 127.0.0.1:8443>
         Require all denied
     </Directory>
 
+    Alias /admin_denied.html /opt/killbot/html/admin_denied.html
+    <Directory /opt/killbot/html>
+        <Files 'admin_denied.html'>
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
     Alias /too_many_requests.html /opt/killbot/html/too_many_requests.html
     <Directory /opt/killbot/html>
         <Files 'too_many_requests.html'>
@@ -3506,6 +3530,7 @@ configContent="<VirtualHost 127.0.0.1:8443>
 
     RewriteRule ^ - [E=KBCHECK_MUST_BE:true]
     LuaHookFixups /opt/killbot/lua/\$domain.lua handle
+    LuaHookAccessChecker /opt/killbot/lua/\$domain-waf.lua waf_access early
 "
     
 if [[ "\$https" == "https" ]]; then 
@@ -3523,6 +3548,9 @@ configContent+="
 
         ProxyPass /access_denied.html !
         ProxyPass /opt/killbot/html/access_denied.html !
+
+        ProxyPass /admin_denied.html !
+        ProxyPass /opt/killbot/html/admin_denied.html !
 
         ProxyPass /too_many_requests.html !
         ProxyPass /opt/killbot/html/too_many_requests.html !
@@ -3894,6 +3922,14 @@ configContent="<VirtualHost 127.0.0.1:8443>
         Require all denied
     </Directory>
 
+    Alias /admin_denied.html /opt/killbot/html/admin_denied.html
+    <Directory /opt/killbot/html>
+        <Files "admin_denied.html">
+            Require all granted
+        </Files>
+        Require all denied
+    </Directory>
+
     Alias /too_many_requests.html /opt/killbot/html/too_many_requests.html
     <Directory /opt/killbot/html>
         <Files "too_many_requests.html">
@@ -3936,6 +3972,9 @@ configContent+="
 
         ProxyPass /access_denied.html !
         ProxyPass /opt/killbot/html/access_denied.html !
+
+        ProxyPass /admin_denied.html !
+        ProxyPass /opt/killbot/html/admin_denied.html !
 
         ProxyPass /too_many_requests.html !
         ProxyPass /opt/killbot/html/too_many_requests.html !
@@ -4967,6 +5006,15 @@ kb_install_valid_csv() {
     return 0
 }
 
+kb_ensure_waf_lua() {
+    local d="\$1"
+    local f="/opt/killbot/lua/\${d}-waf.lua"
+    local b64
+    [[ -f "\$f" ]] && return 0
+    b64=\$(php -r 'echo base64_encode(json_encode(array("waf_on"=>0,"admin"=>array("enable"=>0,"paths"=>array(),"user_ids"=>array(),"ips"=>array()))));')
+    /opt/killbot/sh/waf_http_data.sh "\$d" "\$b64"
+}
+
 kb_apply_admin_apache() {
     local d="\${domain#www.}"
     local rc=0
@@ -4974,6 +5022,7 @@ kb_apply_admin_apache() {
         echo "Invalid domain." >&2
         return 1
     fi
+    kb_ensure_waf_lua "\$d" || return 1
     if [[ -n "\$admin_b64" ]]; then
         if [[ "\${#admin_b64}" -gt 1048576 ]] || [[ ! "\$admin_b64" =~ ^[A-Za-z0-9+/=]+\$ ]]; then
             echo "ERROR: bad admin data" >&2
@@ -5739,6 +5788,7 @@ fi
 
 kb_sed_file "/etc/apache2/sites-available/\$domain_without_www-killbot.conf" -e 's|\.access\.log combined\$|.access.log combined_kb|'
 
+kb_ensure_waf_lua "\$domain_without_www" || exit 1
 if [[ -n "\$admin_mode" || -n "\$admin_b64" ]]; then
     kb_apply_admin_apache || exit 1
 fi
@@ -6492,35 +6542,36 @@ foreach (array_slice($admin_ip_lines, 0, 80) as $ip) {
         $admin_ips[] = $ip;
     }
 }
+$admin_on = 0;
+if (array_key_exists('enable', $admin_in)) {
+    $admin_on = !empty($admin_in['enable']) ? 1 : 0;
+} elseif (!empty($admin_paths)) {
+    $admin_on = 1;
+}
 
 $out = '/opt/killbot/lua/' . $domain . '-waf.lua';
+$kept_rules = null;
 if (!$rules_sent && isset($decoded['admin']) && is_file($out)) {
     $old = file_get_contents($out);
-    $c1 = 0;
-    $c2 = 0;
-    $c3 = 0;
-    if (is_string($old) && $old !== '') {
-        $old = preg_replace('/^local admin_paths = .*$/m', 'local admin_paths = ' . waf_lua_strings($admin_paths), $old, 1, $c1);
-        $old = preg_replace('/^local admin_users = .*$/m', 'local admin_users = ' . waf_lua_strings($admin_users), $old, 1, $c2);
-        $old = preg_replace('/^local admin_ips = .*$/m', 'local admin_ips = ' . waf_lua_strings($admin_ips), $old, 1, $c3);
+    if (is_string($old) && preg_match('/^local rules = \{.*?\n\}/ms', $old, $rm)) {
+        $kept_rules = $rm[0];
     }
-    if ($c1 === 1 && $c2 === 1 && $c3 === 1) {
-        echo $old;
-        exit(0);
+    if (is_string($old) && !array_key_exists('waf_on', $decoded) && preg_match('/^local waf_on = ([01])\s*$/m', $old, $wm)) {
+        $waf_on = (int) $wm[1];
     }
 }
 
-$lua = <<<'LUA'
-require "apache2"
-
-local rules = {
-LUA;
-$lua .= implode(",\n", $chunks);
-$lua .= "\n}\n";
+$lua = "require \"apache2\"\n\n";
+if ($kept_rules !== null) {
+    $lua .= $kept_rules . "\n";
+} else {
+    $lua .= "local rules = {\n" . implode(",\n", $chunks) . "\n}\n";
+}
 $lua .= 'local waf_on = ' . (int) $waf_on . "\n";
 $lua .= 'local admin_paths = ' . waf_lua_strings($admin_paths) . "\n";
 $lua .= 'local admin_users = ' . waf_lua_strings($admin_users) . "\n";
 $lua .= 'local admin_ips = ' . waf_lua_strings($admin_ips) . "\n";
+$lua .= 'local admin_on = ' . (int) $admin_on . "\n";
 $lua .= <<<'LUA'
 
 local function mask_match(mask, value)
@@ -6811,6 +6862,19 @@ local function show_verification(r)
     return apache2.DONE
 end
 
+local function show_admin_denied(r)
+    local f = io.open("/opt/killbot/html/admin_denied.html", "r")
+    local result = ""
+    if f then
+        result = f:read("*a") or ""
+        f:close()
+    end
+    r.status = 403
+    r.content_type = "text/html; charset=UTF-8"
+    r:puts(result)
+    return apache2.DONE
+end
+
 function waf_access(r)
     local uri = r.uri or "/"
     local method = string.upper(r.method or "GET")
@@ -6926,21 +6990,24 @@ function waf_access(r)
         end
     end
     end
-    local skip_admin = (uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/too_many_requests.html")
-    local is_admin = false
-    if not skip_admin then
+    local skip_admin = (uri == "/verification.php" or uri == "/FakeBot.php" or uri == "/access_denied.html" or uri == "/admin_denied.html" or uri == "/too_many_requests.html")
+    if admin_on == 1 and not skip_admin then
+        local is_admin = false
         for _, mask in ipairs(admin_paths) do
             if mask_match(mask, uri) then
                 is_admin = true
                 break
             end
         end
-    end
-    if is_admin then
-        local ip = request_ip(r)
-        local uid = request_user_id(r)
-        if not list_has(admin_ips, ip) and not list_has(admin_users, uid) then
-            return show_verification(r)
+        if is_admin then
+            local uid = request_user_id(r)
+            if uid == "" or uid == "0" or uid == "NONE" then
+                return show_verification(r)
+            end
+            local ip = request_ip(r)
+            if not list_has(admin_ips, ip) and not list_has(admin_users, uid) then
+                return show_admin_denied(r)
+            end
         end
     end
     return apache2.OK
@@ -6963,7 +7030,7 @@ chmod 755 /opt/killbot/sh/waf_http_data.sh
 
 cat > /opt/killbot/sh/waf_http_admin.sh << 'WAF_HTTP_ADMIN_EOF'
 #!/bin/bash
-# Insert or remove the admin-path Apache hook. Runs as root from install.sh.
+# Turn the admin-path check on or off inside the waf lua. The Apache hook stays.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -6982,94 +7049,19 @@ if [ "$enable" != "0" ] && [ "$enable" != "1" ]; then
   exit 1
 fi
 
-WAF_DOMAIN="$domain" WAF_ENABLE="$enable" php << 'PHP'
-<?php
-$domain = strtolower((string) getenv('WAF_DOMAIN'));
-$enable = ((string) getenv('WAF_ENABLE') === '1') ? 1 : 0;
-if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
-    fwrite(STDERR, "invalid domain\n");
-    exit(1);
-}
-$lua = '/opt/killbot/lua/' . $domain . '-waf.lua';
-$hook = 'LuaHookAccessChecker ' . $lua . ' waf_access early';
-if ($enable && !is_file($lua)) {
-    fwrite(STDERR, "waf lua missing\n");
-    exit(1);
-}
-$files = array(
-    '/etc/apache2/sites-available/' . $domain . '.conf',
-    '/etc/apache2/sites-available/' . $domain . '-killbot.conf',
-);
-$found = false;
-$changed = false;
-$backup = array();
-foreach ($files as $file) {
-    if (!is_file($file)) {
-        continue;
-    }
-    $found = true;
-    $text = file_get_contents($file);
-    if ($text === false) {
-        fwrite(STDERR, "cannot read apache conf\n");
-        exit(1);
-    }
-    $backup[$file] = $text;
-    $lines = preg_split("/\r\n|\n|\r/", $text);
-    $out = array();
-    $added = false;
-    foreach ($lines as $line) {
-        if (strpos($line, $lua) !== false) {
-            continue;
-        }
-        $out[] = $line;
-        if ($enable && !$added && strpos($line, 'LuaHookFixups') !== false) {
-            $out[] = $hook;
-            $added = true;
-        }
-    }
-    if ($enable && !$added) {
-        $idx = -1;
-        for ($i = count($out) - 1; $i >= 0; $i--) {
-            if (strpos($out[$i], '</VirtualHost>') !== false) {
-                $idx = $i;
-                break;
-            }
-        }
-        if ($idx >= 0) {
-            array_splice($out, $idx, 0, array($hook));
-        } else {
-            $out[] = $hook;
-        }
-    }
-    $new = implode("\n", $out);
-    if (substr($text, -1) === "\n") {
-        $new .= "\n";
-    }
-    if ($new !== $text) {
-        if (file_put_contents($file, $new) === false) {
-            fwrite(STDERR, "cannot write apache conf\n");
-            exit(1);
-        }
-        $changed = true;
-    }
-}
-if (!$found) {
-    echo "Success\n";
-    exit(0);
-}
-if ($changed) {
-    $test = shell_exec('apache2ctl configtest 2>&1');
-    if (stripos((string) $test, 'Syntax OK') === false) {
-        foreach ($backup as $file => $text) {
-            file_put_contents($file, $text);
-        }
-        fwrite(STDERR, 'apache config ' . trim((string) $test) . "\n");
-        exit(1);
-    }
-    shell_exec('service apache2 reload 2>&1');
-}
-echo "Success\n";
-PHP
+out="/opt/killbot/lua/${domain}-waf.lua"
+if [ ! -f "$out" ]; then
+  echo "waf lua missing" >&2
+  exit 1
+fi
+body=$(sed -e "s/^local admin_on = .*/local admin_on = ${enable}/" "$out") || exit 1
+if ! printf '%s\n' "$body" | grep -Eq "^local admin_on = ${enable}$"; then
+  body=$(printf '%s\n' "$body" | sed "/^local admin_ips = .*/a local admin_on = ${enable}")
+fi
+printf '%s\n' "$body" > "$out"
+chmod 644 "$out"
+apache2ctl graceful >/dev/null 2>&1 || service apache2 reload >/dev/null 2>&1 || true
+echo Success
 WAF_HTTP_ADMIN_EOF
 chmod 755 /opt/killbot/sh/waf_http_admin.sh
 
@@ -7471,14 +7463,6 @@ if (\$type == "install"){
     if (\$https)      \$command .= " -https " . escapeshellarg(\$https);
     \$command .= " -le " . escapeshellarg((string) \$le);
     \$command .= " -www " . escapeshellarg((string) \$www);
-    \$waf_admin_enable = isset(\$_GET["waf_admin_enable"]) ? (string) \$_GET["waf_admin_enable"] : "";
-    \$waf_admin_raw = isset(\$_GET["waf_http_data"]) ? preg_replace('/\s+/', '', (string) \$_GET["waf_http_data"]) : "";
-    if (\$waf_admin_enable === "0" || \$waf_admin_enable === "1") {
-        \$command .= " -admin " . escapeshellarg(\$waf_admin_enable);
-    }
-    if (\$waf_admin_raw !== "" && preg_match('/^[A-Za-z0-9+\/=]+\$/', \$waf_admin_raw)) {
-        \$command .= " -admindata " . escapeshellarg(\$waf_admin_raw);
-    }
 }
 
 \$command .= " 2>&1";
