@@ -1,5 +1,9 @@
 #!/bin/bash
-# Block an IP that received too many HTTP 404 responses.
+# Block an IP that received too many listed HTTP status codes.
+# The codes are summed together over the window. Default is 404 and 403.
+# Not scheduled. A search bot re-crawling removed pages looks the same as a
+# scanner here. scanner-probe.sh is the cron job. This file stays so an
+# install can still clear old scanner-404 iptables rules.
 # Same iptables DROP as subnet-monitor.sh, separate ban file and comment
 # so the two scripts do not remove each other's rules.
 
@@ -14,6 +18,7 @@ DEFAULT_LOG_FILES="/var/log/nginx/access.log"
 DEFAULT_THRESHOLD_404=10
 DEFAULT_LOG_WINDOW_SECONDS=60
 DEFAULT_BAN_TIME=86400
+DEFAULT_STATUS_CODES="404,403"
 
 CONFIG_FILE="/opt/killbot/f2b/scanner-404.conf"
 WHITELIST_FILE="/opt/killbot/f2b/subnet-monitor-whitelist.conf"
@@ -22,6 +27,7 @@ LOG_FILES="$DEFAULT_LOG_FILES"
 THRESHOLD_404="$DEFAULT_THRESHOLD_404"
 LOG_WINDOW_SECONDS="$DEFAULT_LOG_WINDOW_SECONDS"
 BAN_TIME="$DEFAULT_BAN_TIME"
+STATUS_CODES="$DEFAULT_STATUS_CODES"
 
 mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
 if [ -f "$CONFIG_FILE" ]; then
@@ -35,8 +41,12 @@ else
 # Access log (globs allowed). Same file subnet-monitor reads.
 LOG_FILES="$DEFAULT_LOG_FILES"
 
-# Block when an IP got this many 404 responses in the window.
+# Block when an IP got this many matching responses in the window.
+# STATUS_CODES are added together, so 6 of 404 and 4 of 403 is 10.
 THRESHOLD_404=$DEFAULT_THRESHOLD_404
+
+# Status codes counted together. Comma-separated, for example 404,403.
+STATUS_CODES="$DEFAULT_STATUS_CODES"
 
 # How far back from the last log line to count, in seconds.
 LOG_WINDOW_SECONDS=$DEFAULT_LOG_WINDOW_SECONDS
@@ -50,10 +60,43 @@ EOF
     echo "Configuration file created: $CONFIG_FILE"
 fi
 
+if [ -f "$CONFIG_FILE" ] && ! grep -q '^STATUS_CODES=' "$CONFIG_FILE"; then
+    cat >> "$CONFIG_FILE" << EOF
+
+# Status codes counted together. Comma-separated, for example 404,403.
+STATUS_CODES="$DEFAULT_STATUS_CODES"
+EOF
+fi
+
 [[ "${THRESHOLD_404:-}" =~ ^[0-9]+$ ]] || THRESHOLD_404=$DEFAULT_THRESHOLD_404
 [[ "${LOG_WINDOW_SECONDS:-}" =~ ^[0-9]+$ ]] || LOG_WINDOW_SECONDS=$DEFAULT_LOG_WINDOW_SECONDS
 [[ "${BAN_TIME:-}" =~ ^[0-9]+$ ]] || BAN_TIME=$DEFAULT_BAN_TIME
 [ -n "${WHITELIST_FILE:-}" ] || WHITELIST_FILE="/opt/killbot/f2b/subnet-monitor-whitelist.conf"
+
+# Keep only 3-digit HTTP codes. Invalid items are dropped. Empty falls back to 404,403.
+normalize_status_codes() {
+    local raw="$1" item out="" seen=" "
+    raw="${raw//[[:space:]]/}"
+    IFS=',' read -ra parts <<< "$raw"
+    for item in "${parts[@]}"; do
+        [[ "$item" =~ ^[1-5][0-9][0-9]$ ]] || continue
+        case "$seen" in
+            *" $item "*) continue ;;
+        esac
+        seen="$seen$item "
+        if [ -n "$out" ]; then
+            out="$out,$item"
+        else
+            out="$item"
+        fi
+    done
+    if [ -z "$out" ]; then
+        echo "$DEFAULT_STATUS_CODES"
+    else
+        echo "$out"
+    fi
+}
+STATUS_CODES="$(normalize_status_codes "${STATUS_CODES:-$DEFAULT_STATUS_CODES}")"
 
 BAN_LOG="/var/log/killbot/scanner-404-block.log"
 UNBAN_LOG="/var/log/killbot/scanner-404-unban.log"
@@ -118,9 +161,11 @@ get_last_log_timestamp() {
     echo "${ts:-0}"
 }
 
-# Print "count ip" for 404s in the window. Status is the code after the quoted request.
+# Print "count ip" for the configured status codes in the window.
+# Status is the code after the quoted request. The codes are summed per IP.
 count_404() {
-    local window="${LOG_WINDOW_SECONDS}" now_ts last_ts limit_ts log_file
+    local window="${LOG_WINDOW_SECONDS}" now_ts last_ts limit_ts log_file code_list
+    code_list=",${STATUS_CODES},"
     now_ts=$(date +%s)
     for log_file in $LOG_FILES; do
         [ -f "$log_file" ] || continue
@@ -128,7 +173,7 @@ count_404() {
         last_ts=$(get_last_log_timestamp "$log_file")
         [ "${last_ts:-0}" -gt 0 ] || last_ts="$now_ts"
         limit_ts=$((last_ts - window))
-        tail -n 200000 "$log_file" | awk -v limit_ts="$limit_ts" -v last_ts="$last_ts" '
+        tail -n 200000 "$log_file" | awk -v limit_ts="$limit_ts" -v last_ts="$last_ts" -v codes="$code_list" '
             function mon2n(m) {
                 m = tolower(m)
                 if (m=="jan") return 1
@@ -155,7 +200,7 @@ count_404() {
                 log_ts = mktime(sprintf("%04d %02d %02d %02d %02d %02d", a[3]+0, mon, a[1]+0, a[4]+0, a[5]+0, a[6]+0))
                 if (log_ts < limit_ts || log_ts > last_ts) next
                 if (match($0, /"[^"]*"[[:space:]]+([0-9]{3})[[:space:]]/, mm) == 0) next
-                if (mm[1] != "404") next
+                if (index(codes, "," mm[1] ",") == 0) next
                 ipC[$1]++
             }
             END {
@@ -173,14 +218,14 @@ our_rule_number() {
 ban_ip() {
     local ip="$1" count="$2" timestamp
     if ip_whitelisted "$ip"; then
-        echo "$(date): SKIP (whitelist): $ip - $count 404/${LOG_WINDOW_SECONDS}s" | tee -a "$BAN_LOG"
+        echo "$(date): SKIP (whitelist): $ip - $count ${STATUS_CODES}/${LOG_WINDOW_SECONDS}s" | tee -a "$BAN_LOG"
         return 0
     fi
     if [ -n "$(our_rule_number "$ip")" ]; then
         return 0
     fi
     timestamp=$(date +%s)
-    echo "$(date): Blocking IP $ip - $count 404 in ${LOG_WINDOW_SECONDS}s" | tee -a "$BAN_LOG"
+    echo "$(date): Blocking IP $ip - $count ${STATUS_CODES} in ${LOG_WINDOW_SECONDS}s" | tee -a "$BAN_LOG"
     sudo iptables -A "$IPTABLES_CHAIN" -s "$ip" -m comment --comment "$IPTABLES_COMMENT_TAG" -j DROP
     echo "$timestamp $ip" >> "$BAN_FILE"
 }
@@ -234,7 +279,7 @@ run_scan() {
 show_bans() {
     local line ban_time ip left current_time
     echo "=== scanner-404 ==="
-    echo "threshold: $THRESHOLD_404 404 in ${LOG_WINDOW_SECONDS}s, ban ${BAN_TIME}s"
+    echo "threshold: $THRESHOLD_404 of ${STATUS_CODES} in ${LOG_WINDOW_SECONDS}s, ban ${BAN_TIME}s"
     echo "ban file: $BAN_FILE"
     current_time=$(date +%s)
     if [ -s "$BAN_FILE" ]; then
@@ -280,7 +325,7 @@ clear_bans() {
 
 test_scan() {
     local count ip
-    echo "$(date): 404 counts in the last ${LOG_WINDOW_SECONDS}s, block at ${THRESHOLD_404}"
+    echo "$(date): ${STATUS_CODES} counts in the last ${LOG_WINDOW_SECONDS}s, block at ${THRESHOLD_404}"
     count_404 | sort -nr | while read -r count ip; do
         [ -n "$count" ] || continue
         if [ "$count" -ge "$THRESHOLD_404" ]; then

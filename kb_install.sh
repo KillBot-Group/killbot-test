@@ -598,6 +598,10 @@ if [ -f /opt/killbot/f2b/scanner-404.sh ]; then
   chmod +x /opt/killbot/f2b/scanner-404.sh 2>/dev/null || true
   bash /opt/killbot/f2b/scanner-404.sh clear || true
 fi
+if [ -f /opt/killbot/f2b/scanner-probe.sh ]; then
+  chmod +x /opt/killbot/f2b/scanner-probe.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/scanner-probe.sh clear || true
+fi
 
 # unblock traffic if anything is still blocked
 if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
@@ -2118,6 +2122,16 @@ FILE="/opt/killbot/f2b/scanner-404.sh"
         exit 1
     fi
 
+FILE="/opt/killbot/f2b/scanner-probe.sh"
+    kb_download "$FILE" "sh/scanner-probe.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "scanner-probe loaded."
+    else
+        echo "Error loading the scanner-probe."
+        exit 1
+    fi
+
 FILE="/opt/killbot/f2b/unblock_traffic.sh"
     kb_download "$FILE" "sh/unblock_traffic.sh"
 
@@ -2290,6 +2304,7 @@ for f in \
     /opt/killbot/read_apache_log.sh \
     /opt/killbot/f2b/subnet-monitor.sh \
     /opt/killbot/f2b/scanner-404.sh \
+    /opt/killbot/f2b/scanner-probe.sh \
     /opt/killbot/UpdateAll.sh \
     /opt/killbot/official_allowed_ips.sh \
     /opt/killbot/cert_delete.sh \
@@ -6967,6 +6982,51 @@ local function show_verification(r)
     return apache2.DONE
 end
 
+local function safe_ipv4(value)
+    if type(value) ~= "string" or #value > 15 then
+        return ""
+    end
+    local a, b, c, d = value:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then
+        return ""
+    end
+    local function octet(part)
+        if #part > 1 and part:sub(1, 1) == "0" then
+            return false
+        end
+        local n = tonumber(part)
+        return n ~= nil and n >= 0 and n <= 255
+    end
+    if not octet(a) or not octet(b) or not octet(c) or not octet(d) then
+        return ""
+    end
+    return value
+end
+
+local function safe_ip(value)
+    local v4 = safe_ipv4(value)
+    if v4 ~= "" then
+        return v4
+    end
+    if type(value) ~= "string" or #value < 2 or #value > 39 then
+        return ""
+    end
+    if not value:match("^[%x:]+$") or not value:find(":", 1, true) then
+        return ""
+    end
+    return value
+end
+
+local function safe_user_id(value)
+    if type(value) ~= "string" then
+        return ""
+    end
+    if not value:match("^[0-9]+$") or #value > 20 or value == "0" then
+        return ""
+    end
+    return value
+end
+
 local function show_admin_denied(r)
     local f = io.open("/opt/killbot/html/admin_denied.html", "r")
     local result = ""
@@ -6974,6 +7034,16 @@ local function show_admin_denied(r)
         result = f:read("*a") or ""
         f:close()
     end
+    local ip = safe_ip(request_ip(r))
+    local uid = safe_user_id(request_user_id(r))
+    if ip == "" then
+        ip = "-"
+    end
+    if uid == "" then
+        uid = "-"
+    end
+    result = result:gsub("{current_ip}", ip)
+    result = result:gsub("{kbUserID}", uid)
     r.status = 403
     r.content_type = "text/html; charset=UTF-8"
     r:puts(result)
@@ -7248,7 +7318,7 @@ function kb_sanitize(\$value) {
     }
     \$value = str_replace("\0", '', (string) \$value);
     \$value = preg_replace('/[\x00-\x1F\x7F]/', '', \$value);
-    \$value = preg_replace('/[^a-zA-Z0-9 .,:@_\/+\-=()\[\]#?&%]/', '', \$value);
+    \$value = preg_replace('/[^a-zA-Z0-9 .,:@_\/+\-=()\[\]#?&%\$]/', '', \$value);
     return \$value;
 }
 
@@ -7734,7 +7804,8 @@ echo "# Clean unuser certs for KillBot
 #* * * * * root /opt/killbot/f2b/check_apache_and_block.sh>/var/log/killbot/check_apache_and_block.log
 * * * * * root /opt/killbot/f2b/subnet-monitor.sh run >> /var/log/killbot/subnet-monitor-cron-run.log
 30 */2 * * * root /opt/killbot/f2b/subnet-monitor.sh clear >> /var/log/killbot/subnet-monitor-cron-clear.log
-* * * * * root /opt/killbot/f2b/scanner-404.sh run >> /var/log/killbot/scanner-404-cron-run.log
+# scanner-404.sh is not scheduled: 404 counts also match a search bot re-crawling removed pages
+* * * * * root /opt/killbot/f2b/scanner-probe.sh run >> /var/log/killbot/scanner-probe-cron-run.log
 3 */3 * * * root /opt/killbot/f2b/unblock_traffic.sh >> /var/log/killbot/unblock_traffic.log
 0 0 * * * root /opt/killbot/official_allowed_ips.sh >> /var/log/killbot/official_allowed_ips.log 2>&1
 */20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-apache-20min.status /etc/logrotate.d/apache2
@@ -7753,6 +7824,10 @@ fi
 if [ -f /opt/killbot/f2b/scanner-404.sh ]; then
   chmod +x /opt/killbot/f2b/scanner-404.sh 2>/dev/null || true
   bash /opt/killbot/f2b/scanner-404.sh clear || true
+fi
+if [ -f /opt/killbot/f2b/scanner-probe.sh ]; then
+  chmod +x /opt/killbot/f2b/scanner-probe.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/scanner-probe.sh clear || true
 fi
 
 # unblock traffic if anything is still blocked
