@@ -168,23 +168,53 @@ echo "(function () {
 ?>
 
 
-function kbSQM() {
-  let frames = 0;
-  let startTime = performance.now();  
-  const countFrame = () => {
-    frames++;
-    const elapsed = performance.now() - startTime;
-    window.kbRTHJ = Math.round((frames * 1000) / elapsed);
-    if (elapsed < 500) {
-      requestAnimationFrame(countFrame);
-    }
-  };  
-  requestAnimationFrame(countFrame);
+window.kbRTHJ = 0;
+var kbFpsQueue = [];
+var kbFpsFrames = 0;
+var kbFpsStart = 0;
+var kbFpsDone = false;
+function kbFpsFinish() {
+  if (kbFpsDone) return;
+  kbFpsDone = true;
+  var q = kbFpsQueue;
+  kbFpsQueue = [];
+  for (var i = 0; i < q.length; i++) {
+    try { q[i](); } catch (e) {}
+  }
 }
-
-try{
-kbSQM();
-}catch(e){
+function kbFpsFrame(now) {
+  if (kbFpsDone) return;
+  if (!kbFpsStart) kbFpsStart = now;
+  kbFpsFrames++;
+  var elapsed = now - kbFpsStart;
+  if (elapsed > 0) {
+    window.kbRTHJ = Math.round((kbFpsFrames * 1000) / elapsed);
+  }
+  if (elapsed < 50) requestAnimationFrame(kbFpsFrame);
+  else kbFpsFinish();
+}
+try { requestAnimationFrame(kbFpsFrame); } catch (e) { kbFpsDone = true; }
+function kbAfterFps(fn) {
+  if (kbFpsDone || window.kbRTHJ) {
+    fn();
+    return;
+  }
+  kbFpsQueue.push(fn);
+  var spins = 0;
+  function tick() {
+    if (kbFpsDone) return;
+    if (window.kbRTHJ) {
+      kbFpsFinish();
+      return;
+    }
+    spins++;
+    if (spins >= 3) {
+      kbFpsFinish();
+      return;
+    }
+    setTimeout(tick, 16);
+  }
+  setTimeout(tick, 16);
 }
 
 function kbSsend2(url,data,kbpost=true) {
@@ -458,9 +488,9 @@ nn=ww=ss=null;
 try{const vertexShaderSource="attribute vec2 a_position;void main() {   gl_Position = vec4(a_position, 0.0, 1.0);}",fragmentShaderSource="precision highp float;uniform vec2 u_resolution;uniform float u_time;float getLTD(float value) {   if (value<0.0) value = -value;   float f = fract(value);   float lastScaledFraction1 = 0.0;   float lastScaledFraction = floor(f*100.0);   for (int i = 0; i < 100; i++) {       if (f > 0.0) {           float v = floor(f * 100.0);           float f = fract(f * 100.0);\t\tlastScaledFraction1 = lastScaledFraction;           lastScaledFraction = v;       } else {           break;       }   }   return lastScaledFraction/100.0;}void main() {   vec2 uv = gl_FragCoord.xy / u_resolution.xy;   if (gl_FragCoord.xy.x < 2.0 || gl_FragCoord.xy.y < 2.0 || gl_FragCoord.xy.x > 126.0 || gl_FragCoord.xy.y > 62.0  ) {       float xpos = (floor(gl_FragCoord.xy.x)  + floor(64.0-gl_FragCoord.xy.y) ) / 255.0;       float ypos = (floor(gl_FragCoord.xy.x)  + floor(64.0-gl_FragCoord.xy.y) ) / 255.0;       float zpos = (floor(gl_FragCoord.xy.x)  + floor(64.0-gl_FragCoord.xy.y) ) / 255.0;       gl_FragColor = vec4(xpos, ypos, zpos, 1.0);       return;    }    float xpos = cos(log(257.0));   float ypos = atan(13.0);   float zpos = (exp(3.0) - exp(-3.0)) / 2.0;   for (int i = 0; i < 1; i++) {   xpos = sin(xpos);   \typos = cos(ypos);   \tzpos = sqrt(zpos)*sin(6.0);}   gl_FragColor = vec4(getLTD(xpos), getLTD(ypos), getLTD(zpos), 1.0);}";
 function main(){var b=document.createElement("div");document.body.appendChild(b);var a=b.attachShadow({mode:"open"}),c=document.createElement("canvas");c.style.visibility="hidden";a.appendChild(c);c.width=128;c.height=64;if(a=c.getContext("webgl")){const d=createProgram(a,vertexShaderSource,fragmentShaderSource);if(!d){console.error("Failed to create program");return}const e=a.getAttribLocation(d,"a_position"),f=a.getUniformLocation(d,"u_resolution"),g=a.getUniformLocation(d,"u_time"),h=a.createBuffer();
 a.bindBuffer(a.ARRAY_BUFFER,h);a.bufferData(a.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),a.STATIC_DRAW);a.enableVertexAttribArray(e);a.vertexAttribPointer(e,2,a.FLOAT,!1,0,0);resizeCanvasToDisplaySize(a.canvas);a.viewport(0,0,a.canvas.width,a.canvas.height);a.clearColor(0,0,0,1);a.clear(a.COLOR_BUFFER_BIT);a.useProgram(d);a.uniform2f(f,a.canvas.width,a.canvas.height);a.uniform1f(g,performance.now()/1E3);a.drawArrays(a.TRIANGLES,0,6)}c=c.toDataURL("image/png").replace(/^data:image\/(png|jpg);base64,/,
-"");kbSsend(<?=$js_host?>+"/wr.php?url="+<?=$js_url?>+"&r="+<?=$js_r?>+"&png="+png+"&raf="+window.kbRTHJ+"&lv="+<?=$js_lv?>+"&id="+btoa(kbID2)+"&p="+btoa(kbIP)+"&rr="+Date.now()+"&u="+btoa(unescape(encodeURIComponent(JSON.stringify(kbU))))+"&c="+<?=$js_c?>+"&ng="+(a?0:1)+"&ybf="+ybf<?=$js_extra_q?>,h_data+"|"+i_data+"|"+btoa(c));document.body.removeChild(b)}
+"");kbAfterFps(function(){kbSsend(<?=$js_host?>+"/wr.php?url="+<?=$js_url?>+"&r="+<?=$js_r?>+"&png="+png+"&raf="+window.kbRTHJ+"&lv="+<?=$js_lv?>+"&id="+btoa(kbID2)+"&p="+btoa(kbIP)+"&rr="+Date.now()+"&u="+btoa(unescape(encodeURIComponent(JSON.stringify(kbU))))+"&c="+<?=$js_c?>+"&ng="+(a?0:1)+"&ybf="+ybf<?=$js_extra_q?>,h_data+"|"+i_data+"|"+btoa(c));});document.body.removeChild(b)}
 function createProgram(b,a,c){a=compileShader(b,b.VERTEX_SHADER,a);c=compileShader(b,b.FRAGMENT_SHADER,c);if(!a||!c) throw new Error("Failed to compile fragment shader");const d=b.createProgram();b.attachShader(d,a);b.attachShader(d,c);b.linkProgram(d);return b.getProgramParameter(d,b.LINK_STATUS)?d:(console.error("Program link error:",b.getProgramInfoLog(d)),b.deleteProgram(d),b.deleteShader(a),b.deleteShader(c),null)}
-function compileShader(b,a,c){a=b.createShader(a);b.shaderSource(a,c);b.compileShader(a);return b.getShaderParameter(a,b.COMPILE_STATUS)?a:(console.error("Shader compile error:",b.getShaderInfoLog(a)),b.deleteShader(a),null)}function resizeCanvasToDisplaySize(b){const a=b.clientWidth,c=b.clientHeight;if(b.width!==a||b.height!==c)b.width=a,b.height=c}main();}catch(r){kbSsend(<?=$js_host?>+"/wr.php?url="+<?=$js_url?>+"&r="+<?=$js_r?>+"&png="+png+"&raf="+window.kbRTHJ+"&lv="+<?=$js_lv?>+"&id="+btoa(kbID2)+"&p="+btoa(kbIP)+"&rr="+Date.now()+"&u="+btoa(unescape(encodeURIComponent(JSON.stringify(kbU))))+"&c="+<?=$js_c?>+"&ng=1&ybf="+ybf<?=$js_extra_q?>,h_data+"|"+i_data);};
+function compileShader(b,a,c){a=b.createShader(a);b.shaderSource(a,c);b.compileShader(a);return b.getShaderParameter(a,b.COMPILE_STATUS)?a:(console.error("Shader compile error:",b.getShaderInfoLog(a)),b.deleteShader(a),null)}function resizeCanvasToDisplaySize(b){const a=b.clientWidth,c=b.clientHeight;if(b.width!==a||b.height!==c)b.width=a,b.height=c}main();}catch(r){kbAfterFps(function(){kbSsend(<?=$js_host?>+"/wr.php?url="+<?=$js_url?>+"&r="+<?=$js_r?>+"&png="+png+"&raf="+window.kbRTHJ+"&lv="+<?=$js_lv?>+"&id="+btoa(kbID2)+"&p="+btoa(kbIP)+"&rr="+Date.now()+"&u="+btoa(unescape(encodeURIComponent(JSON.stringify(kbU))))+"&c="+<?=$js_c?>+"&ng=1&ybf="+ybf<?=$js_extra_q?>,h_data+"|"+i_data);});};
 
 
 }
