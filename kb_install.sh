@@ -4775,6 +4775,8 @@ declare cdn_paths=""
 declare cdn_static=""
 declare https="https"
 declare cv_b64=""
+declare admin_mode=""
+declare admin_file=""
 
 DNS_SERVERS=("77.88.8.8" "8.8.8.8")  # yandex, Google
 RANDOM_INDEX=\$(( \${#DNS_SERVERS[@]} > 0 ? RANDOM % \${#DNS_SERVERS[@]} : 0 ))
@@ -4965,6 +4967,41 @@ kb_install_valid_csv() {
     return 0
 }
 
+kb_apply_admin_apache() {
+    local d="\${domain#www.}"
+    local rc=0
+    if ! kb_install_valid_domain "\$d"; then
+        echo "Invalid domain." >&2
+        return 1
+    fi
+    if [[ -n "\$admin_file" ]]; then
+        case "\$admin_file" in
+            /tmp/*|/var/tmp/*) ;;
+            *) echo "ERROR: bad admin file" >&2; return 1 ;;
+        esac
+        if [[ ! -f "\$admin_file" ]]; then
+            echo "ERROR: admin file missing" >&2
+            return 1
+        fi
+        /opt/killbot/sh/waf_http_data.sh "\$d" < "\$admin_file" || rc=\$?
+        rm -f "\$admin_file"
+        admin_file=""
+        if [[ "\$rc" -ne 0 ]]; then
+            echo "ERROR: waf lua write failed" >&2
+            return 1
+        fi
+    fi
+    if [[ -z "\$admin_mode" ]]; then
+        echo "Success"
+        return 0
+    fi
+    if [[ "\$admin_mode" != "0" && "\$admin_mode" != "1" ]]; then
+        echo "Invalid -admin value." >&2
+        return 1
+    fi
+    /opt/killbot/sh/waf_http_admin.sh "\$d" "\$admin_mode"
+}
+
 while [[ "\$#" -gt 0 ]]; do
     if [[ -z "\$1" ]]; then
         break
@@ -5002,12 +5039,23 @@ while [[ "\$#" -gt 0 ]]; do
             www="\$2"; shift 2;;
         -cv)
             cv_b64="\$2"; shift 2;;
+        -admin)
+            admin_mode="\$2"; shift 2;;
+        -adminfile)
+            admin_file="\$2"; shift 2;;
         *)
             trimmed="\$(echo -n "\$1" | xargs)"
             [[ -n "\$trimmed" ]] && { echo "Unknown arg: '\$1'"; exit 1; } || shift 1
             ;;
     esac
 done
+
+if [[ -n "\$admin_mode" || -n "\$admin_file" ]]; then
+    if [[ -z "\$email" && -z "\$token" && -z "\$backend_ip" ]]; then
+        kb_apply_admin_apache
+        exit \$?
+    fi
+fi
 
 if [[ -z "\$email" && -z "\$token" ]]; then
     echo "Error: argument email (-e) or token (-t) is required" >&2
@@ -5682,6 +5730,10 @@ fi
 
 sed -i 's|\.access\.log combined\$|.access.log combined_kb|' /etc/apache2/sites-available/\$domain_without_www-killbot.conf
 
+if [[ -n "\$admin_mode" || -n "\$admin_file" ]]; then
+    kb_apply_admin_apache || exit 1
+fi
+
 apache_check=\$(sudo apachectl configtest 2>&1)
 
 if echo "\$apache_check" | grep -q "Syntax OK"; then
@@ -6231,9 +6283,13 @@ if (!is_array($decoded)) {
 }
 $waf_on = 1;
 $admin_in = array();
+$rules_sent = false;
 if (isset($decoded['rules']) || isset($decoded['admin']) || array_key_exists('waf_on', $decoded)) {
-    $rules = (isset($decoded['rules']) && is_array($decoded['rules'])) ? $decoded['rules'] : array();
-    $waf_on = !empty($decoded['waf_on']) ? 1 : 0;
+    $rules_sent = array_key_exists('rules', $decoded);
+    $rules = ($rules_sent && is_array($decoded['rules'])) ? $decoded['rules'] : array();
+    if (array_key_exists('waf_on', $decoded)) {
+        $waf_on = !empty($decoded['waf_on']) ? 1 : 0;
+    }
     $admin_in = (isset($decoded['admin']) && is_array($decoded['admin'])) ? $decoded['admin'] : array();
 }
 else {
@@ -6422,6 +6478,30 @@ foreach (array_slice($admin_ip_lines, 0, 80) as $ip) {
     $ip = trim((string) $ip);
     if (filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, $admin_ips, true)) {
         $admin_ips[] = $ip;
+    }
+}
+
+$out = '/opt/killbot/lua/' . $domain . '-waf.lua';
+if (!$rules_sent && isset($decoded['admin']) && is_file($out)) {
+    $old = file_get_contents($out);
+    $c1 = 0;
+    $c2 = 0;
+    $c3 = 0;
+    if (is_string($old) && $old !== '') {
+        $old = preg_replace('/^local admin_paths = .*$/m', 'local admin_paths = ' . waf_lua_strings($admin_paths), $old, 1, $c1);
+        $old = preg_replace('/^local admin_users = .*$/m', 'local admin_users = ' . waf_lua_strings($admin_users), $old, 1, $c2);
+        $old = preg_replace('/^local admin_ips = .*$/m', 'local admin_ips = ' . waf_lua_strings($admin_ips), $old, 1, $c3);
+    }
+    if ($c1 === 1 && $c2 === 1 && $c3 === 1) {
+        $tmp_keep = $out . '.tmp';
+        if (file_put_contents($tmp_keep, $old) === false || !rename($tmp_keep, $out)) {
+            @unlink($tmp_keep);
+            fwrite(STDERR, "cannot save lua\n");
+            exit(1);
+        }
+        @chmod($out, 0644);
+        echo "Success\n";
+        exit(0);
     }
 }
 
@@ -6879,6 +6959,118 @@ PHP
 WAF_HTTP_DATA_EOF
 chmod 755 /opt/killbot/sh/waf_http_data.sh
 
+cat > /opt/killbot/sh/waf_http_admin.sh << 'WAF_HTTP_ADMIN_EOF'
+#!/bin/bash
+# Insert or remove the admin-path Apache hook. Runs as root from install.sh.
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 domain 0|1" >&2
+  exit 1
+fi
+
+domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+enable="$2"
+if ! printf '%s' "$domain" | grep -Eq '^[a-z0-9.-]+$' || printf '%s' "$domain" | grep -q '\.\.'; then
+  echo "invalid domain" >&2
+  exit 1
+fi
+if [ "$enable" != "0" ] && [ "$enable" != "1" ]; then
+  echo "invalid admin flag" >&2
+  exit 1
+fi
+
+php - "$domain" "$enable" << 'PHP'
+<?php
+$domain = isset($argv[1]) ? strtolower((string) $argv[1]) : '';
+$enable = (isset($argv[2]) && (string) $argv[2] === '1') ? 1 : 0;
+if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
+    fwrite(STDERR, "invalid domain\n");
+    exit(1);
+}
+$lua = '/opt/killbot/lua/' . $domain . '-waf.lua';
+$hook = 'LuaHookAccessChecker ' . $lua . ' waf_access early';
+if ($enable && !is_file($lua)) {
+    fwrite(STDERR, "waf lua missing\n");
+    exit(1);
+}
+$files = array(
+    '/etc/apache2/sites-available/' . $domain . '.conf',
+    '/etc/apache2/sites-available/' . $domain . '-killbot.conf',
+);
+$found = false;
+$changed = false;
+$backup = array();
+foreach ($files as $file) {
+    if (!is_file($file)) {
+        continue;
+    }
+    $found = true;
+    $text = file_get_contents($file);
+    if ($text === false) {
+        fwrite(STDERR, "cannot read apache conf\n");
+        exit(1);
+    }
+    $backup[$file] = $text;
+    $lines = preg_split("/\r\n|\n|\r/", $text);
+    $out = array();
+    $added = false;
+    foreach ($lines as $line) {
+        if (strpos($line, $lua) !== false) {
+            continue;
+        }
+        $out[] = $line;
+        if ($enable && !$added && strpos($line, 'LuaHookFixups') !== false) {
+            $out[] = $hook;
+            $added = true;
+        }
+    }
+    if ($enable && !$added) {
+        $idx = -1;
+        for ($i = count($out) - 1; $i >= 0; $i--) {
+            if (strpos($out[$i], '</VirtualHost>') !== false) {
+                $idx = $i;
+                break;
+            }
+        }
+        if ($idx >= 0) {
+            array_splice($out, $idx, 0, array($hook));
+        } else {
+            $out[] = $hook;
+        }
+    }
+    $new = implode("\n", $out);
+    if (substr($text, -1) === "\n") {
+        $new .= "\n";
+    }
+    if ($new !== $text) {
+        if (file_put_contents($file, $new) === false) {
+            fwrite(STDERR, "cannot write apache conf\n");
+            exit(1);
+        }
+        $changed = true;
+    }
+}
+if (!$found) {
+    echo "Success\n";
+    exit(0);
+}
+if ($changed) {
+    $test = shell_exec('apache2ctl configtest 2>&1');
+    if (stripos((string) $test, 'Syntax OK') === false) {
+        foreach ($backup as $file => $text) {
+            file_put_contents($file, $text);
+        }
+        fwrite(STDERR, 'apache config ' . trim((string) $test) . "\n");
+        exit(1);
+    }
+    shell_exec('service apache2 reload 2>&1');
+}
+echo "Success\n";
+PHP
+WAF_HTTP_ADMIN_EOF
+chmod 755 /opt/killbot/sh/waf_http_admin.sh
+
 cat > /var/www/html/kb.php <<EOF
 <?php
 \$allowedIps = [    
@@ -7001,8 +7193,7 @@ if (\$type == "waf_http_data" || \$type == "waf_http_enable") {
         echo "invalid domain";
         exit;
     }
-    \$waf_lua = "/opt/killbot/lua/" . \$waf_domain . "-waf.lua";
-    \$waf_hook = "LuaHookAccessChecker " . \$waf_lua . " waf_access early";
+    \$cmd = "sudo /opt/killbot/install.sh -d " . escapeshellarg(\$waf_domain);
     if (\$type == "waf_http_data") {
         \$raw = isset(\$_GET["waf_http_data"]) ? (string) \$_GET["waf_http_data"] : "";
         \$raw = preg_replace('/\s+/', '', \$raw);
@@ -7010,119 +7201,28 @@ if (\$type == "waf_http_data" || \$type == "waf_http_enable") {
             echo "ERROR: bad waf_http_data";
             exit;
         }
-        \$waf_script = "/opt/killbot/sh/waf_http_data.sh";
-        if (!is_file(\$waf_script)) {
-            echo "ERROR: waf script missing";
+        \$admin_tmp = tempnam(sys_get_temp_dir(), "kbadmin");
+        if (\$admin_tmp === false || file_put_contents(\$admin_tmp, \$raw) === false) {
+            echo "ERROR: cannot store admin data";
             exit;
         }
-        \$cmd = sprintf('sudo %s %s', escapeshellarg(\$waf_script), escapeshellarg(\$waf_domain));
-        \$desc = array(0 => array('pipe', 'r'), 1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
-        \$proc = proc_open(\$cmd, \$desc, \$pipes);
-        if (!is_resource(\$proc)) {
-            echo "ERROR: cannot start waf script";
-            exit;
+        @chmod(\$admin_tmp, 0644);
+        \$cmd .= " -adminfile " . escapeshellarg(\$admin_tmp);
+    } else {
+        \$waf_enable = (isset(\$_GET["enable"]) && (string) \$_GET["enable"] === "1") ? "1" : "0";
+        \$cmd .= " -admin " . escapeshellarg(\$waf_enable);
+    }
+    \$cmd .= " 2>&1";
+    \$output = array();
+    \$code = 0;
+    exec(\$cmd, \$output, \$code);
+    \$text = trim(implode("\n", \$output));
+    if (\$code !== 0 || stripos(\$text, "Success") === false) {
+        if (\$text === "") {
+            \$text = "install.sh failed";
         }
-        fwrite(\$pipes[0], \$raw);
-        fclose(\$pipes[0]);
-        \$waf_out = stream_get_contents(\$pipes[1]);
-        \$waf_err = stream_get_contents(\$pipes[2]);
-        fclose(\$pipes[1]);
-        fclose(\$pipes[2]);
-        \$waf_code = proc_close(\$proc);
-        if (\$waf_code !== 0) {
-            echo "ERROR: " . trim((string) \$waf_err . (string) \$waf_out);
-            exit;
-        }
-        echo "Success";
+        echo "ERROR: " . \$text;
         exit;
-    }
-    \$waf_enable = (isset(\$_GET["enable"]) && (string) \$_GET["enable"] === "1") ? 1 : 0;
-    if (\$waf_enable && !is_file(\$waf_lua)) {
-        echo "ERROR: waf lua missing";
-        exit;
-    }
-    \$waf_files = array(
-        "/etc/apache2/sites-available/" . \$waf_domain . ".conf",
-        "/etc/apache2/sites-available/" . \$waf_domain . "-killbot.conf",
-    );
-    \$waf_found = false;
-    \$waf_changed = false;
-    \$waf_backup = array();
-    foreach (\$waf_files as \$waf_file) {
-        if (!is_file(\$waf_file)) {
-            continue;
-        }
-        \$waf_found = true;
-        \$waf_text = file_get_contents(\$waf_file);
-        if (\$waf_text === false) {
-            echo "ERROR: cannot read apache conf";
-            exit;
-        }
-        \$waf_backup[\$waf_file] = \$waf_text;
-        \$waf_lines = preg_split("/\r\n|\n|\r/", \$waf_text);
-        \$waf_out_lines = array();
-        \$waf_added = false;
-        foreach (\$waf_lines as \$waf_line) {
-            if (strpos(\$waf_line, \$waf_lua) !== false) {
-                continue;
-            }
-            \$waf_out_lines[] = \$waf_line;
-            if (\$waf_enable && !\$waf_added && strpos(\$waf_line, "LuaHookFixups") !== false) {
-                \$waf_out_lines[] = \$waf_hook;
-                \$waf_added = true;
-            }
-        }
-        if (\$waf_enable && !\$waf_added) {
-            \$waf_idx = -1;
-            for (\$waf_i = count(\$waf_out_lines) - 1; \$waf_i >= 0; \$waf_i--) {
-                if (strpos(\$waf_out_lines[\$waf_i], "</VirtualHost>") !== false) {
-                    \$waf_idx = \$waf_i;
-                    break;
-                }
-            }
-            if (\$waf_idx >= 0) {
-                array_splice(\$waf_out_lines, \$waf_idx, 0, array(\$waf_hook));
-            } else {
-                \$waf_out_lines[] = \$waf_hook;
-            }
-        }
-        \$waf_new = implode("\n", \$waf_out_lines);
-        if (substr(\$waf_text, -1) === "\n") {
-            \$waf_new .= "\n";
-        }
-        if (\$waf_new !== \$waf_text) {
-            \$waf_tmp = tempnam(sys_get_temp_dir(), "waf");
-            if (\$waf_tmp === false || file_put_contents(\$waf_tmp, \$waf_new) === false) {
-                echo "ERROR: cannot write apache conf";
-                exit;
-            }
-            \$waf_cp = shell_exec(sprintf("sudo cp %s %s 2>&1", escapeshellarg(\$waf_tmp), escapeshellarg(\$waf_file)));
-            @unlink(\$waf_tmp);
-            if (\$waf_cp !== null && trim((string) \$waf_cp) !== "") {
-                echo "ERROR: " . trim((string) \$waf_cp);
-                exit;
-            }
-            \$waf_changed = true;
-        }
-    }
-    if (!\$waf_found) {
-        echo "ERROR: apache conf not found";
-        exit;
-    }
-    if (\$waf_changed) {
-        \$waf_test = shell_exec("sudo apache2ctl configtest 2>&1");
-        if (stripos((string) \$waf_test, "Syntax OK") === false) {
-            foreach (\$waf_backup as \$waf_file => \$waf_text) {
-                \$waf_tmp = tempnam(sys_get_temp_dir(), "waf");
-                if (\$waf_tmp !== false && file_put_contents(\$waf_tmp, \$waf_text) !== false) {
-                    shell_exec(sprintf("sudo cp %s %s 2>&1", escapeshellarg(\$waf_tmp), escapeshellarg(\$waf_file)));
-                    @unlink(\$waf_tmp);
-                }
-            }
-            echo "ERROR: apache config " . trim((string) \$waf_test);
-            exit;
-        }
-        shell_exec("sudo service apache2 reload 2>&1");
     }
     echo "Success";
     exit;
@@ -7375,6 +7475,18 @@ if (\$type == "install"){
     if (\$https)      \$command .= " -https " . escapeshellarg(\$https);
     \$command .= " -le " . escapeshellarg((string) \$le);
     \$command .= " -www " . escapeshellarg((string) \$www);
+    \$waf_admin_enable = isset(\$_GET["waf_admin_enable"]) ? (string) \$_GET["waf_admin_enable"] : "";
+    \$waf_admin_raw = isset(\$_GET["waf_http_data"]) ? preg_replace('/\s+/', '', (string) \$_GET["waf_http_data"]) : "";
+    if (\$waf_admin_enable === "0" || \$waf_admin_enable === "1") {
+        \$command .= " -admin " . escapeshellarg(\$waf_admin_enable);
+    }
+    if (\$waf_admin_raw !== "" && preg_match('/^[A-Za-z0-9+\/=]+\$/', \$waf_admin_raw)) {
+        \$waf_admin_tmp = tempnam(sys_get_temp_dir(), "kbadmin");
+        if (\$waf_admin_tmp !== false && file_put_contents(\$waf_admin_tmp, \$waf_admin_raw) !== false) {
+            @chmod(\$waf_admin_tmp, 0644);
+            \$command .= " -adminfile " . escapeshellarg(\$waf_admin_tmp);
+        }
+    }
 }
 
 \$command .= " 2>&1";
