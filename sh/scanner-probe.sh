@@ -85,6 +85,23 @@ mkdir -p /var/log/killbot 2>/dev/null
 [ -f "$BAN_FILE" ] || touch "$BAN_FILE"
 
 declare -ga WL_ITEMS=()
+declare -gA SELF_IPS=()
+SELF_IPS_LOADED=0
+
+# Addresses configured on this machine. A health check to the public IP is
+# logged with that address as the client, and a DROP of it cuts the server
+# off from itself.
+load_self_ips() {
+    [ "$SELF_IPS_LOADED" -eq 1 ] && return 0
+    SELF_IPS_LOADED=1
+    SELF_IPS=()
+    local addr
+    SELF_IPS["127.0.0.1"]=1
+    while read -r addr; do
+        [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        SELF_IPS["$addr"]=1
+    done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+}
 
 load_whitelist() {
     WL_ITEMS=()
@@ -103,7 +120,8 @@ load_whitelist() {
 
 ip_whitelisted() {
     local ip="$1" item a b c d
-    [[ "$ip" == "127.0.0.1" ]] && return 0
+    load_self_ips
+    [[ -n "${SELF_IPS[$ip]:-}" ]] && return 0
     IFS=. read -r a b c d <<< "$ip"
     for item in "${WL_ITEMS[@]}"; do
         [[ "$item" == "$ip" ]] && return 0
@@ -224,8 +242,16 @@ count_probes() {
 
 our_rule_number() {
     local ip="$1"
-    sudo iptables -L "$IPTABLES_CHAIN" --line-numbers -n -v 2>/dev/null | awk -v ip="$ip" -v tag="$IPTABLES_COMMENT_TAG" '
-        $4 == "DROP" && $9 == ip && index($0, tag) { print $1; exit }'
+    sudo iptables -L "$IPTABLES_CHAIN" --line-numbers -n 2>/dev/null | awk -v ip="$ip" -v tag="$IPTABLES_COMMENT_TAG" '
+        index($0, tag) {
+            for (i = 1; i <= NF; i++) if ($i == ip) { print $1; exit }
+        }'
+}
+
+ip_in_ban_file() {
+    local ip="$1"
+    [ -f "$BAN_FILE" ] || return 1
+    awk -v ip="$ip" '$2 == ip { found = 1 } END { exit found ? 0 : 1 }' "$BAN_FILE"
 }
 
 ban_ip() {
@@ -234,13 +260,47 @@ ban_ip() {
         echo "$(date): SKIP (whitelist): $ip - $count probe paths/${LOG_WINDOW_SECONDS}s $sample" | tee -a "$BAN_LOG"
         return 0
     fi
-    if [ -n "$(our_rule_number "$ip")" ]; then
-        return 0
+    if [ -z "$(our_rule_number "$ip")" ]; then
+        if ! sudo iptables -A "$IPTABLES_CHAIN" -s "$ip" -m comment --comment "$IPTABLES_COMMENT_TAG" -j DROP; then
+            echo "$(date): Failed to block $ip - $count probe paths/${LOG_WINDOW_SECONDS}s $sample" | tee -a "$BAN_LOG"
+            return 1
+        fi
+        echo "$(date): Blocking IP $ip - $count probe paths in ${LOG_WINDOW_SECONDS}s $sample" | tee -a "$BAN_LOG"
     fi
-    timestamp=$(date +%s)
-    echo "$(date): Blocking IP $ip - $count probe paths in ${LOG_WINDOW_SECONDS}s $sample" | tee -a "$BAN_LOG"
-    sudo iptables -A "$IPTABLES_CHAIN" -s "$ip" -m comment --comment "$IPTABLES_COMMENT_TAG" -j DROP
-    echo "$timestamp $ip" >> "$BAN_FILE"
+    if ! ip_in_ban_file "$ip"; then
+        timestamp=$(date +%s)
+        echo "$timestamp $ip" >> "$BAN_FILE"
+    fi
+}
+
+# The ban file is the list of addresses that must stay dropped until they expire.
+# A missing iptables rule is put back. The file line is not written if iptables refused it.
+ensure_ban_rules() {
+    local now_line ban_time ip current_time time_passed
+    declare -A want=()
+    [ -s "$BAN_FILE" ] || return 0
+    current_time=$(date +%s)
+    while IFS= read -r now_line; do
+        [ -z "$now_line" ] && continue
+        ban_time=$(echo "$now_line" | awk '{print $1}')
+        ip=$(echo "$now_line" | awk '{print $2}')
+        [[ "$ban_time" =~ ^[0-9]+$ ]] || continue
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        time_passed=$((current_time - ban_time))
+        [ "$time_passed" -ge "$BAN_TIME" ] && continue
+        if ip_whitelisted "$ip"; then
+            continue
+        fi
+        want["$ip"]=1
+    done < "$BAN_FILE"
+    for ip in "${!want[@]}"; do
+        [ -n "$(our_rule_number "$ip")" ] && continue
+        if sudo iptables -A "$IPTABLES_CHAIN" -s "$ip" -m comment --comment "$IPTABLES_COMMENT_TAG" -j DROP; then
+            echo "$(date): Restored missing DROP for $ip" >> "$BAN_LOG"
+        else
+            echo "$(date): Failed to restore DROP for $ip" >> "$BAN_LOG"
+        fi
+    done
 }
 
 unban_expired() {
@@ -270,11 +330,34 @@ unban_expired() {
     mv "$temp_file" "$BAN_FILE"
 }
 
+unban_own_addresses() {
+    local ip rule_num now_line temp_file
+    load_self_ips
+    for ip in "${!SELF_IPS[@]}"; do
+        while true; do
+            rule_num=$(our_rule_number "$ip")
+            [ -z "$rule_num" ] && break
+            echo "$(date): Removing ban of this server's address $ip" >> "$UNBAN_LOG"
+            sudo iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null || break
+        done
+    done
+    [ -s "$BAN_FILE" ] || return 0
+    temp_file=$(mktemp)
+    while IFS= read -r now_line; do
+        [ -z "$now_line" ] && continue
+        ip=$(echo "$now_line" | awk '{print $2}')
+        [[ -n "${SELF_IPS[$ip]:-}" ]] && continue
+        echo "$now_line" >> "$temp_file"
+    done < "$BAN_FILE"
+    mv "$temp_file" "$BAN_FILE"
+}
+
 run_scan() {
     local count ip sample
     declare -A totals=()
     declare -A samples=()
     load_whitelist
+    unban_own_addresses
     while read -r count ip sample; do
         [[ "$count" =~ ^[0-9]+$ ]] || continue
         [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
@@ -291,6 +374,7 @@ run_scan() {
         fi
     done
     unban_expired
+    ensure_ban_rules
 }
 
 show_bans() {
