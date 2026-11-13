@@ -2826,6 +2826,20 @@ local function log_passed(r, reason)
 end
 
 function handle(r)
+    -- kb_waf_first
+    do
+        local waf_chunk = loadfile("/opt/killbot/lua/kb_domain-waf.lua")
+        if waf_chunk then
+            local loaded = pcall(waf_chunk)
+            if loaded and type(waf_access) == "function" then
+                local ran, waf_result = pcall(waf_access, r)
+                if ran and waf_result ~= nil and waf_result ~= apache2.OK and waf_result ~= apache2.DECLINED then
+                    return waf_result
+                end
+            end
+        end
+    end
+
     local user_agent = r.headers_in["User-Agent"] or ""
     local remote_addr = r.subprocess_env["REAL_REMOTE_ADDR"] or ""
     local kb_session = r.subprocess_env["KBSESSION"] or ""
@@ -3530,7 +3544,6 @@ configContent="<VirtualHost 127.0.0.1:8443>
 
     RewriteRule ^ - [E=KBCHECK_MUST_BE:true]
     LuaHookFixups /opt/killbot/lua/\$domain.lua handle
-    LuaHookAccessChecker /opt/killbot/lua/\$domain-waf.lua waf_access early
 "
     
 if [[ "\$https" == "https" ]]; then 
@@ -4512,11 +4525,33 @@ check_solver_health() {
         echo "Error: solver health status missing (\$KB_HEALTH_STATUS_FILE)."
         return 1
     fi
-    local body
+    local body attempt
     body=\$(tr -d '\\r\\n' < "\$KB_HEALTH_STATUS_FILE" 2>/dev/null || true)
     if [ "\$body" = "ok1." ]; then
         echo "Solver health (/var/www/html/solver/index.html): ok1."
         return 0
+    fi
+    # The minute cron can write "apache: not running" while apache2 is restarting.
+    # systemctl is already active again by the time this check runs, so wait and
+    # refresh the file instead of failing on that stale line.
+    if systemctl is-active --quiet apache2; then
+        echo "Apache is up. Waiting for the solver health file to update..."
+        for attempt in 1 2 3 4 5; do
+            sleep 3
+            body=\$(tr -d '\\r\\n' < "\$KB_HEALTH_STATUS_FILE" 2>/dev/null || true)
+            if [ "\$body" = "ok1." ]; then
+                echo "Solver health (/var/www/html/solver/index.html): ok1."
+                return 0
+            fi
+        done
+        if [ -x "\$KB_HEALTH_CHECK_SCRIPT" ]; then
+            "\$KB_HEALTH_CHECK_SCRIPT" >/dev/null 2>&1 || true
+            body=\$(tr -d '\\r\\n' < "\$KB_HEALTH_STATUS_FILE" 2>/dev/null || true)
+            if [ "\$body" = "ok1." ]; then
+                echo "Solver health (/var/www/html/solver/index.html): ok1."
+                return 0
+            fi
+        fi
     fi
     echo "Error: solver health check failed:"
     echo "\$body"
@@ -5707,6 +5742,12 @@ lua_script_sed="\$(kb_sed_repl "\$lua_script")"
 lua_script2_sed="\$(kb_sed_repl "\$lua_script2")"
 domain_sed="\$(kb_sed_repl "\$domain_without_www")"
 sed -e "s|kb_domain|\${domain_sed}|g" -e "s|kb_lua_script|\${lua_script_sed}|g" -e "s|kb2_lua_script|\${lua_script2_sed}|g" -e "s|kb_lua_agents|\${lua_agents_sed}|g" -e "s|kb_lua_paths|\${lua_paths_sed}|g" -e "s|kb_lua_ips|\${lua_ips_sed}|g" /opt/killbot/kb.lua > /opt/killbot/lua/\$domain_without_www.lua
+if [ -f "/opt/killbot/lua/\$domain_without_www-waf.lua" ]; then
+    waf_body=\$(sed 's/if waf_on == 1 then/if waf_on == 1 and #rules > 0 then/' "/opt/killbot/lua/\$domain_without_www-waf.lua") || true
+    if [ -n "\$waf_body" ]; then
+        printf '%s\n' "\$waf_body" > "/opt/killbot/lua/\$domain_without_www-waf.lua"
+    fi
+fi
 
 kb_prepare_visit_log() {
     local f="\$1"
@@ -6323,6 +6364,70 @@ if ! printf '%s' "$b64" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
 fi
 
 mkdir -p /opt/killbot/lua
+
+kb_link_waf_lua() {
+  local domain="$1"
+  local waf="/opt/killbot/lua/${domain}-waf.lua"
+  local site="/opt/killbot/lua/${domain}.lua"
+  local body updated
+  if [ -f "$waf" ]; then
+    body=$(sed 's/if waf_on == 1 then/if waf_on == 1 and #rules > 0 then/' "$waf") || return 1
+    if [ -n "$body" ]; then
+      printf '%s\n' "$body" > "$waf"
+      chmod 644 "$waf"
+    fi
+  fi
+  if [ ! -f "$site" ]; then
+    return 0
+  fi
+  if grep -q 'kb_waf_first' "$site"; then
+    return 0
+  fi
+  updated=$(KB_SITE="$site" KB_DOMAIN="$domain" php << 'PHP'
+<?php
+$site = (string) getenv('KB_SITE');
+$domain = (string) getenv('KB_DOMAIN');
+if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
+    fwrite(STDERR, "invalid domain\n");
+    exit(1);
+}
+$body = file_get_contents($site);
+if (!is_string($body) || $body === '') {
+    fwrite(STDERR, "cannot read site lua\n");
+    exit(1);
+}
+$needle = "function handle(r)\n";
+$pos = strpos($body, $needle);
+if ($pos === false) {
+    fwrite(STDERR, "handle() missing\n");
+    exit(1);
+}
+$pos += strlen($needle);
+$block = "    -- kb_waf_first\n"
+    . "    do\n"
+    . "        local waf_chunk = loadfile(\"/opt/killbot/lua/{$domain}-waf.lua\")\n"
+    . "        if waf_chunk then\n"
+    . "            local loaded = pcall(waf_chunk)\n"
+    . "            if loaded and type(waf_access) == \"function\" then\n"
+    . "                local ran, waf_result = pcall(waf_access, r)\n"
+    . "                if ran and waf_result ~= nil and waf_result ~= apache2.OK and waf_result ~= apache2.DECLINED then\n"
+    . "                    return waf_result\n"
+    . "                end\n"
+    . "            end\n"
+    . "        end\n"
+    . "    end\n\n";
+echo substr($body, 0, $pos) . $block . substr($body, $pos);
+exit(0);
+PHP
+)
+  if [ -z "$updated" ]; then
+    echo "cannot link waf lua" >&2
+    return 1
+  fi
+  printf '%s\n' "$updated" > "$site"
+  chmod 644 "$site"
+}
+
 out="/opt/killbot/lua/${domain}-waf.lua"
 
 lua_body=$(WAF_DOMAIN="$domain" WAF_B64="$b64" php << 'PHP'
@@ -6878,7 +6983,7 @@ end
 function waf_access(r)
     local uri = r.uri or "/"
     local method = string.upper(r.method or "GET")
-    if waf_on == 1 then
+    if waf_on == 1 and #rules > 0 then
     local matched = nil
     for _, rule in ipairs(rules) do
         for _, path in ipairs(rule.paths or {}) do
@@ -7024,13 +7129,15 @@ if [ -z "$lua_body" ]; then
 fi
 printf '%s\n' "$lua_body" > "$out"
 chmod 644 "$out"
+kb_link_waf_lua "$domain"
 echo Success
 WAF_HTTP_DATA_EOF
 chmod 755 /opt/killbot/sh/waf_http_data.sh
 
 cat > /opt/killbot/sh/waf_http_admin.sh << 'WAF_HTTP_ADMIN_EOF'
 #!/bin/bash
-# Turn the admin-path check on or off inside the waf lua. The Apache hook stays.
+# Turn the admin-path check on or off inside the waf lua.
+# The site lua calls that file. Apache config is not changed.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -7049,6 +7156,69 @@ if [ "$enable" != "0" ] && [ "$enable" != "1" ]; then
   exit 1
 fi
 
+kb_link_waf_lua() {
+  local domain="$1"
+  local waf="/opt/killbot/lua/${domain}-waf.lua"
+  local site="/opt/killbot/lua/${domain}.lua"
+  local body updated
+  if [ -f "$waf" ]; then
+    body=$(sed 's/if waf_on == 1 then/if waf_on == 1 and #rules > 0 then/' "$waf") || return 1
+    if [ -n "$body" ]; then
+      printf '%s\n' "$body" > "$waf"
+      chmod 644 "$waf"
+    fi
+  fi
+  if [ ! -f "$site" ]; then
+    return 0
+  fi
+  if grep -q 'kb_waf_first' "$site"; then
+    return 0
+  fi
+  updated=$(KB_SITE="$site" KB_DOMAIN="$domain" php << 'PHP'
+<?php
+$site = (string) getenv('KB_SITE');
+$domain = (string) getenv('KB_DOMAIN');
+if (!preg_match('/^[a-z0-9.-]+$/', $domain) || strpos($domain, '..') !== false) {
+    fwrite(STDERR, "invalid domain\n");
+    exit(1);
+}
+$body = file_get_contents($site);
+if (!is_string($body) || $body === '') {
+    fwrite(STDERR, "cannot read site lua\n");
+    exit(1);
+}
+$needle = "function handle(r)\n";
+$pos = strpos($body, $needle);
+if ($pos === false) {
+    fwrite(STDERR, "handle() missing\n");
+    exit(1);
+}
+$pos += strlen($needle);
+$block = "    -- kb_waf_first\n"
+    . "    do\n"
+    . "        local waf_chunk = loadfile(\"/opt/killbot/lua/{$domain}-waf.lua\")\n"
+    . "        if waf_chunk then\n"
+    . "            local loaded = pcall(waf_chunk)\n"
+    . "            if loaded and type(waf_access) == \"function\" then\n"
+    . "                local ran, waf_result = pcall(waf_access, r)\n"
+    . "                if ran and waf_result ~= nil and waf_result ~= apache2.OK and waf_result ~= apache2.DECLINED then\n"
+    . "                    return waf_result\n"
+    . "                end\n"
+    . "            end\n"
+    . "        end\n"
+    . "    end\n\n";
+echo substr($body, 0, $pos) . $block . substr($body, $pos);
+exit(0);
+PHP
+)
+  if [ -z "$updated" ]; then
+    echo "cannot link waf lua" >&2
+    return 1
+  fi
+  printf '%s\n' "$updated" > "$site"
+  chmod 644 "$site"
+}
+
 out="/opt/killbot/lua/${domain}-waf.lua"
 if [ ! -f "$out" ]; then
   echo "waf lua missing" >&2
@@ -7060,7 +7230,7 @@ if ! printf '%s\n' "$body" | grep -Eq "^local admin_on = ${enable}$"; then
 fi
 printf '%s\n' "$body" > "$out"
 chmod 644 "$out"
-apache2ctl graceful >/dev/null 2>&1 || service apache2 reload >/dev/null 2>&1 || true
+kb_link_waf_lua "$domain"
 echo Success
 WAF_HTTP_ADMIN_EOF
 chmod 755 /opt/killbot/sh/waf_http_admin.sh
