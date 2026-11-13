@@ -1,25 +1,5 @@
 <?php
-// Определяем домен из запроса
-$domain = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
-
-// Если кука есть - продолжаем обычную логику
-// Определить язык браузера пользователя
 $acceptLang = isset($_SERVER['HTTP_ACCEPT_LANGUAGE']) ? $_SERVER['HTTP_ACCEPT_LANGUAGE'] : '';
-
-
-// Проверяем наличие куки kbConnected
-if (!isset($_COOKIE['kbConnected'])) {
-    // Если куки нет - редирект на /api/reloadDNS с параметром host
-    setcookie('kbConnected', '1', time() + 300, '/');
-    if (strpos($acceptLang, 'ru') === 0) {
-        header("Location: https://killbot.ru/api/reloadDNS?host=" . urlencode($domain));
-    }else{
-        header("Location: https://my.kill-bot.net/api/reloadDNS?host=" . urlencode($domain));
-    }
-    exit;
-}
-
-// Обрезаем пробелы и переводим в нижний регистр
 $acceptLang = strtolower(trim($acceptLang));
 
 if (strpos($acceptLang, 'ru') === 0) {

@@ -61,14 +61,14 @@ if (isset($_GET["url"])&&$_GET["url"]!=""){
     $url = base64_decode($_GET["url"]);
     $query = parse_url($url, PHP_URL_QUERY);
     $url_host = parse_url($url, PHP_URL_HOST);    
-    parse_str($query, $output_u);
+    parse_str(is_string($query) ? $query : '', $output_u);
 }
 
 $output_rr = array();
 if (isset($_GET["r"]) && $_GET["r"] !== "" && isset($_SERVER['HTTP_REFERER']) && $_SERVER['HTTP_REFERER'] !== "") {
     $referer = base64_decode($_GET["r"]);
     $query = parse_url($referer, PHP_URL_QUERY);
-    parse_str($query, $output_rr);
+    parse_str(is_string($query) ? $query : '', $output_rr);
 }
 
 
@@ -77,7 +77,7 @@ if (isset($_GET["r"])&&$_GET["r"]!=""){
     $referer = base64_decode($_GET["r"]);
     $query = parse_url($referer, PHP_URL_QUERY);
     $referer_host = parse_url($referer, PHP_URL_HOST);    
-    parse_str($query, $output_r);
+    parse_str(is_string($query) ? $query : '', $output_r);
 }
 
 
@@ -242,53 +242,7 @@ function kbSendErrors2(){
 
 var ybf = 0;
 
-(function kbWaitForBody() {
-  
-  if (document.body) return Promise.resolve();
-  
-  return new Promise(resolve => {
-    const observer = new MutationObserver(() => {
-      if (document.body) {
-        observer.disconnect();
-        resolve();
-      }
-    });
-    
-    observer.observe(document.documentElement, { childList: true });
-    
-    // Fallback на случай проблем с MutationObserver
-    const interval = setInterval(() => {
-      if (document.body) {
-        clearInterval(interval);
-        observer.disconnect();
-        resolve();
-      }
-    }, 50);
-  });
-})()
-.then(() => {
-<?php if (kb_check_images_support()): ?>
-    var kbI = new Image();
-    kbI.src = <?=$js_host?>+"/hk.php?png="+png+"&rr="+Date.now()+"&c="+<?=$js_c?>;
-    kbI.onload = () => {
-    kbJob();
-    };
-
-    kbI.onerror = () => {
-    kbJob();
-    };
-<?php else: ?>
-    kbJob();
-<?php endif; ?>
-})
-.catch(error => {
-  kbErrors.push({
-    message: error.message,
-    stack: error.stack,
-    name: error.name
-  });
-  kbSendErrors2();
-});
+kbJob();
 
 
 

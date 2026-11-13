@@ -541,7 +541,8 @@ server {
     return 301 https://\$host\$request_uri;
 }
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name ${proxy_fqdn};
     ssl_certificate     ${SSL_CERT};
     ssl_certificate_key ${SSL_KEY};
