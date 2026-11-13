@@ -387,12 +387,11 @@ unban_old_subnets() {
             local duration_str=$(format_duration "$time_passed")
             echo "$(date): Unbanning $subnet (elapsed $duration_str)" >> "$UNBAN_LOG"
 
-            # Remove from iptables (check via -n cache; re-read rule numbers on each delete)
+            # Remove only our rules. scanner-404.sh uses the same chain with another comment.
             if grep -qF -- "$subnet" <<< "$SUBNET_MON_IPTABLES_LIST"; then
-                # Find and delete all rules for this subnet
                 while true; do
                     local rule_num=$(sudo iptables -L "$IPTABLES_CHAIN" --line-numbers -n 2>/dev/null | \
-                                   grep "$subnet" | head -1 | awk '{print $1}')
+                                   grep -F "$subnet" | grep -F "subnet-monitor" | head -1 | awk '{print $1}')
                     [ -z "$rule_num" ] && break
 
                     sudo iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null && \
@@ -955,6 +954,7 @@ clear_all_bans() {
         $4 == "DROP" {
             src = $9
             line = $0
+            if (line ~ /scanner-404/) next
             if (line ~ /subnet-monitor/) { print line; next }
             if (src ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/(24|16)$/) { print line; next }
             if (src ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print line; next }

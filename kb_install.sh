@@ -594,6 +594,10 @@ if [ -f /opt/killbot/f2b/subnet-monitor.sh ]; then
   chmod +x /opt/killbot/f2b/subnet-monitor.sh 2>/dev/null || true
   bash /opt/killbot/f2b/subnet-monitor.sh clear || true
 fi
+if [ -f /opt/killbot/f2b/scanner-404.sh ]; then
+  chmod +x /opt/killbot/f2b/scanner-404.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/scanner-404.sh clear || true
+fi
 
 # unblock traffic if anything is still blocked
 if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
@@ -1502,7 +1506,8 @@ ${KB_NGINX_IP_HEADERS}
 }
 
 server {
-    listen 443 ssl default_server;    
+    listen 443 ssl default_server;
+    http2 on;
     server_name _;
 
     include /etc/nginx/conf.d/killbot-too-many-requests.inc;
@@ -2103,6 +2108,16 @@ FILE="/opt/killbot/f2b/subnet-monitor.sh"
         exit 1
     fi
 
+FILE="/opt/killbot/f2b/scanner-404.sh"
+    kb_download "$FILE" "sh/scanner-404.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "scanner-404 loaded."
+    else
+        echo "Error loading the scanner-404."
+        exit 1
+    fi
+
 FILE="/opt/killbot/f2b/unblock_traffic.sh"
     kb_download "$FILE" "sh/unblock_traffic.sh"
 
@@ -2262,6 +2277,7 @@ for f in \
     /opt/killbot/check_host_curl.sh \
     /opt/killbot/read_apache_log.sh \
     /opt/killbot/f2b/subnet-monitor.sh \
+    /opt/killbot/f2b/scanner-404.sh \
     /opt/killbot/UpdateAll.sh \
     /opt/killbot/official_allowed_ips.sh \
     /opt/killbot/cert_delete.sh \
@@ -3626,6 +3642,27 @@ if [[ -f /opt/killbot/load_nginx_custom_conf.sh ]]; then
     load_nginx_custom_conf "\$domain"
 fi
 : "\${KB_proxy_ssl_verify:=off}"
+
+kb_overwrite_forwarded_ip=1
+if [ -f /opt/killbot/settings.php ]; then
+    kb_fwd="\$(php -d display_errors=0 -r 'include "/opt/killbot/settings.php"; if (!isset(\$kb_overwrite_forwarded_ip)) { echo "1"; } else { echo empty(\$kb_overwrite_forwarded_ip) ? "0" : "1"; }' 2>/dev/null || echo 1)"
+    kb_fwd="\${kb_fwd//\$'\r'/}"
+    kb_fwd="\${kb_fwd##*\$'\n'}"
+    if [ "\$kb_fwd" = "0" ]; then
+        kb_overwrite_forwarded_ip=0
+    fi
+fi
+if [ "\$kb_overwrite_forwarded_ip" = "1" ]; then
+    KB_NGINX_IP_HEADERS='        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;'
+else
+    KB_NGINX_IP_HEADERS='        set \$kb_x_real_ip \$http_x_real_ip;
+        if (\$kb_x_real_ip = "") {
+            set \$kb_x_real_ip \$remote_addr;
+        }
+        proxy_set_header X-Real-IP \$kb_x_real_ip;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;'
+fi
 
 KB_SOLVER_SNIPPET=""
 if [ -f /etc/nginx/snippets/killbot.conf ]; then
@@ -7439,6 +7476,7 @@ echo "# Clean unuser certs for KillBot
 #* * * * * root /opt/killbot/f2b/check_apache_and_block.sh>/var/log/killbot/check_apache_and_block.log
 * * * * * root /opt/killbot/f2b/subnet-monitor.sh run >> /var/log/killbot/subnet-monitor-cron-run.log
 30 */2 * * * root /opt/killbot/f2b/subnet-monitor.sh clear >> /var/log/killbot/subnet-monitor-cron-clear.log
+* * * * * root /opt/killbot/f2b/scanner-404.sh run >> /var/log/killbot/scanner-404-cron-run.log
 3 */3 * * * root /opt/killbot/f2b/unblock_traffic.sh >> /var/log/killbot/unblock_traffic.log
 0 0 * * * root /opt/killbot/official_allowed_ips.sh >> /var/log/killbot/official_allowed_ips.log 2>&1
 */20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-apache-20min.status /etc/logrotate.d/apache2
@@ -7453,6 +7491,10 @@ echo "# Clean unuser certs for KillBot
 if [ -f /opt/killbot/f2b/subnet-monitor.sh ]; then
   chmod +x /opt/killbot/f2b/subnet-monitor.sh 2>/dev/null || true
   bash /opt/killbot/f2b/subnet-monitor.sh clear || true
+fi
+if [ -f /opt/killbot/f2b/scanner-404.sh ]; then
+  chmod +x /opt/killbot/f2b/scanner-404.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/scanner-404.sh clear || true
 fi
 
 # unblock traffic if anything is still blocked
