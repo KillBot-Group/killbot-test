@@ -2916,7 +2916,7 @@ if (window.kbTitleVerification==true) {
                 var kbHashStr = (typeof kbKey === 'string') ? kbKey : (kbDNS ? 'dns' : '');
                 var kbSrv = kbServerURL;
                 kbPendingCnUri = "/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
-                        "&r=" + encodeURIComponent(btoa(document.referrer)) + "&url=" + encodeURIComponent(btoa(location.href)) +
+                        "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
                         "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
                         "&png=" + kbPageTs +
                         "&srv=" + encodeURIComponent(kbSrv);
