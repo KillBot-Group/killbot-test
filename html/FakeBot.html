@@ -1,21 +1,30 @@
 <?php
 $ips = array();
 
-$cliForwardedFor = (isset($argc)&&$argc > 1) ? $argv[1] : null;
-$cliRemoteAddr = (isset($argc)&&$argc > 2) ? $argv[2] : null;
-$user_agent = (isset($argc)&&$argc > 3) ? $argv[3] : null;
+$kb_cli_xff = getenv('KB_CLI_XFF');
+$kb_cli_ip = getenv('KB_CLI_IP');
+$kb_cli_ua = getenv('KB_CLI_UA');
+if ($kb_cli_xff === false) {
+    $kb_cli_xff = (isset($argc) && $argc > 1) ? $argv[1] : null;
+}
+if ($kb_cli_ip === false) {
+    $kb_cli_ip = (isset($argc) && $argc > 2) ? $argv[2] : null;
+}
+if ($kb_cli_ua === false) {
+    $kb_cli_ua = (isset($argc) && $argc > 3) ? $argv[3] : null;
+}
 
 $httpXForwardedFor = isset($_SERVER['HTTP_X_FORWARDED_FOR']) 
     ? $_SERVER['HTTP_X_FORWARDED_FOR'] 
-    : $cliForwardedFor;
+    : $kb_cli_xff;
 
 $remoteAddr = isset($_SERVER['REMOTE_ADDR']) 
     ? $_SERVER['REMOTE_ADDR'] 
-    : $cliRemoteAddr;
+    : $kb_cli_ip;
     
 $user_agent = isset($_SERVER['HTTP_USER_AGENT']) 
     ? $_SERVER['HTTP_USER_AGENT'] 
-    : $user_agent;
+    : $kb_cli_ua;
 
 if (!empty($httpXForwardedFor)) {
     $ips = explode(",", $httpXForwardedFor);

@@ -2994,11 +2994,11 @@ end
     local is_real_bot = check_hostname(hostname, user_agent, remote_addr_org)
     
     if is_real_bot == "bot_false" then
-        local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+        local result = run_php_cli("/opt/killbot/html/FakeBot.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
         r.content_type = "text/html"
         r:puts(result)
 
-        log_message("ip:"  .. remote_addr_org .. " fake bot UA without matching rDNS: " .. user_agent .. " VP showed DONE",http_host)
+        log_message("ip:"  .. remote_addr_org .. " fake bot UA without matching rDNS: " .. user_agent .. " fake bot page showed DONE",http_host)
 
         return apache2.DONE
     end
