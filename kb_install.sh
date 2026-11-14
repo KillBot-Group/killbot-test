@@ -911,6 +911,8 @@ replace_if_not_equal() {
 
 # Add directives
 replace_if_not_equal "worker_connections 768;" "worker_connections 5000;"
+replace_if_not_equal "server_tokens on;" "server_tokens off;"
+add_if_missing "server_tokens" "server_tokens off;"
 add_if_missing "server_names_hash_bucket_size" "server_names_hash_bucket_size 128;"
 add_if_missing "client_max_body_size" "client_max_body_size 256M;"
 
