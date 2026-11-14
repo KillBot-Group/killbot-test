@@ -2399,11 +2399,13 @@ local function sh_quote(s)
     return "'" .. string.gsub(s, "'", "'\\''") .. "'"
 end
 
-local function run_php_cli(script, xff, ip, ua, host)
+local function run_php_cli(script, xff, ip, ua, host, uri, referer)
     local cmd = "KB_CLI_XFF=" .. sh_quote(xff) ..
         " KB_CLI_IP=" .. sh_quote(ip) ..
         " KB_CLI_UA=" .. sh_quote(ua) ..
         " KB_CLI_HOST=" .. sh_quote(host) ..
+        " KB_CLI_URI=" .. sh_quote(uri or "") ..
+        " KB_CLI_REFERER=" .. sh_quote(referer or "") ..
         " php " .. sh_quote(script)
     local handle = io.popen(cmd)
     if not handle then
@@ -2996,7 +2998,7 @@ end
     local is_real_bot = check_hostname(hostname, user_agent, remote_addr_org)
     
     if is_real_bot == "bot_false" then
-        local result = run_php_cli("/opt/killbot/html/FakeBot.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+        local result = run_php_cli("/opt/killbot/html/FakeBot.php", x_forwarded_for, remote_addr_org, user_agent, http_host, r.unparsed_uri or r.uri or "/", (r.headers_in and r.headers_in["Referer"]) or "")
         r.content_type = "text/html"
         r:puts(result)
 
@@ -3029,7 +3031,7 @@ end
 --          r.content_type = "text/html"
 --          r:sendfile(r.filename)
 
-            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host, r.unparsed_uri or r.uri or "/", (r.headers_in and r.headers_in["Referer"]) or "")
             r.content_type = "text/html"
             r:puts(result)
 
@@ -3091,7 +3093,7 @@ end
             log_verified(r)
             return apache2.DECLINED
         else    
-            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host)
+            local result = run_php_cli("/opt/killbot/html/verification.php", x_forwarded_for, remote_addr_org, user_agent, http_host, r.unparsed_uri or r.uri or "/", (r.headers_in and r.headers_in["Referer"]) or "")
             r.content_type = "text/html"
             r:puts(result)
 

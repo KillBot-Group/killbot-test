@@ -23,6 +23,15 @@ if ($kb_cli_host === false) {
     $kb_cli_host = (isset($argc) && $argc > 4) ? $argv[4] : '';
 }
 
+$kb_cli_uri = getenv('KB_CLI_URI');
+$kb_cli_referer = getenv('KB_CLI_REFERER');
+if (is_string($kb_cli_uri) && $kb_cli_uri !== '') {
+    $_SERVER['REQUEST_URI'] = $kb_cli_uri;
+}
+if (is_string($kb_cli_referer) && $kb_cli_referer !== '') {
+    $_SERVER['HTTP_REFERER'] = $kb_cli_referer;
+}
+
 $kb_domain_host = ($kb_cli_host !== null && $kb_cli_host !== '') ? $kb_cli_host : ($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '');
 $kb_domain_host = strtolower($kb_domain_host);
 $kb_domain_host = preg_replace('/:\d+$/', '', $kb_domain_host);
@@ -2907,7 +2916,7 @@ if (window.kbTitleVerification==true) {
                 var kbHashStr = (typeof kbKey === 'string') ? kbKey : (kbDNS ? 'dns' : '');
                 var kbSrv = kbServerURL;
                 kbPendingCnUri = "/js/cn.js?hash_str=" + kbHashStr + "&p=" + btoa(kbIP) +
-                        "&r=" + btoa(document.referrer) + "&url=" + btoa(location.href) +
+                        "&r=" + encodeURIComponent(btoa(document.referrer)) + "&url=" + encodeURIComponent(btoa(location.href)) +
                         "&c=" + kbC + "&kbUserID=" + kbUserID + "&lv=" + lv + "&v=0" +
                         "&png=" + kbPageTs +
                         "&srv=" + encodeURIComponent(kbSrv);
