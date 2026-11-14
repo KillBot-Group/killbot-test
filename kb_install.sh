@@ -1783,6 +1783,17 @@ EOF
 </Files>
 EOF
     sudo a2enconf killbot-php-disable >/dev/null
+    # php-fpm.service has ProtectSystem=full, so /etc is read-only for kb.php
+    # and for "sudo install.sh" started from it. Apache used to run kb.php
+    # without that mount, and config writes worked. Open only the trees
+    # install.sh and certbot still need.
+    sudo mkdir -p /etc/letsencrypt \
+        "/etc/systemd/system/php${series}-fpm.service.d"
+    sudo tee "/etc/systemd/system/php${series}-fpm.service.d/killbot-etc-write.conf" >/dev/null <<EOF
+[Service]
+ReadWritePaths=/etc/apache2 /etc/nginx /etc/letsencrypt /etc/systemd
+EOF
+    sudo systemctl daemon-reload
     sudo systemctl enable "php${series}-fpm"
     sudo systemctl restart "php${series}-fpm"
 }
