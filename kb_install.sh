@@ -7324,6 +7324,24 @@ function kb_sanitize(\$value) {
     return \$value;
 }
 
+function kb_sanitize_dns_bots(\$value) {
+    \$value = str_replace("\0", '', (string) \$value);
+    \$value = str_replace(array("\r\n", "\r"), "\n", \$value);
+    \$lines = explode("\n", \$value);
+    \$out = array();
+    foreach (\$lines as \$line) {
+        \$line = trim(\$line);
+        if (\$line === '') {
+            continue;
+        }
+        if (!preg_match('/^[A-Za-z0-9._-]{1,100}\|[A-Za-z0-9._,-]{1,4000}\$/', \$line)) {
+            continue;
+        }
+        \$out[] = \$line;
+    }
+    return implode("\n", \$out);
+}
+
 \$remoteIp = \$_SERVER['REMOTE_ADDR'] ?? '';
 if (!in_array(\$remoteIp, \$allowedIps, true)) {
     echo "Access denied: Your IP = " . \$remoteIp . " is not allowed to configure KillBot DNS Server.";
@@ -7365,7 +7383,7 @@ if (\$kb_config_locked && !in_array(\$type, \$kb_readonly_types, true)) {
 \$folder = kb_sanitize(\$_GET["folder"] ?? null);
 \$wlip = kb_sanitize(\$_GET["wlip"] ?? "") ?? "";
 \$wlua = kb_sanitize(\$_GET["wlua"] ?? "") ?? "";
-\$dns_bots_allowed = isset(\$_GET["dns_bots_allowed"]) ? kb_sanitize(base64_decode((string) \$_GET["dns_bots_allowed"])) : "";
+\$dns_bots_allowed = isset(\$_GET["dns_bots_allowed"]) ? kb_sanitize_dns_bots(base64_decode((string) \$_GET["dns_bots_allowed"])) : "";
 \$cv_b64 = isset(\$_GET["cv"]) ? preg_replace('/[^A-Za-z0-9+\/=]/', '', (string) \$_GET["cv"]) : "";
 \$cv_ok = "";
 if (\$cv_b64 !== "") {
