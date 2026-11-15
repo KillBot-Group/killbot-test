@@ -51,7 +51,8 @@ BAN_TIME=$DEFAULT_BAN_TIME
 # Extra path fragments, one per line. See scanner-probe-extra.conf.
 EXTRA_FILE="$EXTRA_FILE"
 
-# Exact IP, or its /24 or /16, listed here is not blocked.
+# Exact IP or CIDR listed here is not blocked.
+# Yandex and Googlebot networks are added by the script itself.
 WHITELIST_FILE="$WHITELIST_FILE"
 EOF
     echo "Configuration file created: $CONFIG_FILE"
@@ -86,6 +87,197 @@ mkdir -p /var/log/killbot 2>/dev/null
 
 declare -ga WL_ITEMS=()
 declare -gA SELF_IPS=()
+
+# Search-crawler networks. Always applied, and written into the whitelist file.
+# Yandex: https://killbot.ru/ips/yandex.json
+# Googlebot ipv4: https://developers.google.com/static/search/apis/ipranges/googlebot.json (2026-11-13)
+DEFAULT_SEARCH_BOT_CIDRS=(
+    5.45.192.0/18
+    5.255.192.0/18
+    37.9.64.0/18
+    37.140.128.0/18
+    77.88.0.0/18
+    84.252.160.0/19
+    87.250.224.0/19
+    90.156.176.0/20
+    92.255.112.0/20
+    93.158.128.0/18
+    95.108.128.0/17
+    141.8.128.0/18
+    178.154.128.0/18
+    185.32.187.0/24
+    213.180.192.0/19
+    192.178.4.0/27
+    192.178.4.32/27
+    192.178.4.64/27
+    192.178.4.96/27
+    192.178.4.128/27
+    192.178.4.160/27
+    192.178.4.192/27
+    192.178.4.224/27
+    192.178.5.0/27
+    192.178.6.0/27
+    192.178.6.32/27
+    192.178.6.64/27
+    192.178.6.96/27
+    192.178.6.128/27
+    192.178.6.160/27
+    192.178.6.192/27
+    192.178.6.224/27
+    192.178.7.0/27
+    192.178.7.32/27
+    192.178.7.64/27
+    192.178.7.96/27
+    192.178.7.128/27
+    192.178.7.160/27
+    192.178.7.192/27
+    192.178.7.224/27
+    34.22.85.0/27
+    34.64.82.64/28
+    34.65.242.112/28
+    34.80.50.80/28
+    34.88.194.0/28
+    34.89.10.80/28
+    34.89.198.80/28
+    34.96.162.48/28
+    34.100.182.96/28
+    34.101.50.144/28
+    34.118.66.0/28
+    34.118.254.0/28
+    34.126.178.96/28
+    34.146.150.144/28
+    34.147.110.144/28
+    34.151.74.144/28
+    34.152.50.64/28
+    34.154.114.144/28
+    34.155.98.32/28
+    34.165.18.176/28
+    34.175.160.64/28
+    34.176.130.16/28
+    35.247.243.240/28
+    66.249.64.0/27
+    66.249.64.32/27
+    66.249.64.64/27
+    66.249.64.96/27
+    66.249.64.128/27
+    66.249.64.160/27
+    66.249.64.192/27
+    66.249.64.224/27
+    66.249.65.0/27
+    66.249.65.32/27
+    66.249.65.64/27
+    66.249.65.96/27
+    66.249.65.128/27
+    66.249.65.160/27
+    66.249.65.192/27
+    66.249.65.224/27
+    66.249.66.0/27
+    66.249.66.32/27
+    66.249.66.64/27
+    66.249.66.96/27
+    66.249.66.128/27
+    66.249.66.160/27
+    66.249.66.192/27
+    66.249.66.224/27
+    66.249.67.0/27
+    66.249.67.32/27
+    66.249.67.64/27
+    66.249.68.0/27
+    66.249.68.32/27
+    66.249.68.64/27
+    66.249.68.96/27
+    66.249.68.128/27
+    66.249.68.160/27
+    66.249.68.192/27
+    66.249.68.224/27
+    66.249.69.0/27
+    66.249.69.32/27
+    66.249.69.64/27
+    66.249.69.96/27
+    66.249.69.128/27
+    66.249.69.160/27
+    66.249.69.192/27
+    66.249.69.224/27
+    66.249.70.0/27
+    66.249.70.32/27
+    66.249.70.64/27
+    66.249.70.96/27
+    66.249.70.128/27
+    66.249.70.160/27
+    66.249.70.192/27
+    66.249.70.224/27
+    66.249.71.0/27
+    66.249.71.32/27
+    66.249.71.64/27
+    66.249.71.96/27
+    66.249.71.128/27
+    66.249.71.160/27
+    66.249.71.192/27
+    66.249.71.224/27
+    66.249.72.0/27
+    66.249.72.32/27
+    66.249.72.64/27
+    66.249.72.96/27
+    66.249.72.128/27
+    66.249.72.160/27
+    66.249.72.192/27
+    66.249.72.224/27
+    66.249.73.0/27
+    66.249.73.32/27
+    66.249.73.64/27
+    66.249.73.96/27
+    66.249.73.128/27
+    66.249.73.160/27
+    66.249.73.192/27
+    66.249.73.224/27
+    66.249.74.0/27
+    66.249.74.32/27
+    66.249.74.64/27
+    66.249.74.96/27
+    66.249.74.128/27
+    66.249.74.160/27
+    66.249.74.192/27
+    66.249.74.224/27
+    66.249.75.0/27
+    66.249.75.32/27
+    66.249.75.64/27
+    66.249.75.96/27
+    66.249.75.128/27
+    66.249.75.160/27
+    66.249.75.192/27
+    66.249.75.224/27
+    66.249.76.0/27
+    66.249.76.32/27
+    66.249.76.64/27
+    66.249.76.96/27
+    66.249.76.128/27
+    66.249.76.160/27
+    66.249.76.192/27
+    66.249.76.224/27
+    66.249.77.0/27
+    66.249.77.32/27
+    66.249.77.64/27
+    66.249.77.96/27
+    66.249.77.128/27
+    66.249.77.160/27
+    66.249.77.192/27
+    66.249.77.224/27
+    66.249.78.0/27
+    66.249.78.32/27
+    66.249.78.64/27
+    66.249.78.96/27
+    66.249.78.128/27
+    66.249.78.160/27
+    66.249.78.192/27
+    66.249.78.224/27
+    66.249.79.0/27
+    66.249.79.32/27
+    66.249.79.64/27
+    66.249.79.128/27
+    66.249.79.160/27
+    66.249.79.192/27
+    66.249.79.224/27
+)
 SELF_IPS_LOADED=0
 
 # Addresses configured on this machine. A health check to the public IP is
@@ -103,30 +295,83 @@ load_self_ips() {
     done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
 }
 
+# True when ip is the exact address or lies inside a CIDR of any prefix length.
+ip_in_cidr() {
+    local ip="$1" cidr="$2" net mask
+    local ia ib ic id na nb nc nd bits ipo neto shift i
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    if [[ "$cidr" != */* ]]; then
+        [[ "$cidr" == "$ip" ]] && return 0
+        return 1
+    fi
+    IFS=/ read -r net mask <<< "$cidr"
+    [[ "$mask" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || return 1
+    [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r ia ib ic id <<< "$ip"
+    IFS=. read -r na nb nc nd <<< "$net"
+    bits=$mask
+    for i in 1 2 3 4; do
+        case $i in
+            1) ipo=$ia; neto=$na ;;
+            2) ipo=$ib; neto=$nb ;;
+            3) ipo=$ic; neto=$nc ;;
+            4) ipo=$id; neto=$nd ;;
+        esac
+        if (( bits >= 8 )); then
+            (( ipo == neto )) || return 1
+            bits=$((bits - 8))
+        elif (( bits > 0 )); then
+            shift=$((8 - bits))
+            (( (ipo >> shift) == (neto >> shift) )) || return 1
+            return 0
+        else
+            return 0
+        fi
+    done
+    return 0
+}
+
+ensure_search_bot_whitelist() {
+    local dir
+    dir=$(dirname "$WHITELIST_FILE")
+    mkdir -p "$dir" 2>/dev/null || true
+    [ -e "$WHITELIST_FILE" ] || touch "$WHITELIST_FILE" 2>/dev/null || return 0
+    if grep -q 'killbot-search-bots' "$WHITELIST_FILE" 2>/dev/null; then
+        return 0
+    fi
+    {
+        echo ""
+        echo "# killbot-search-bots Yandex and Googlebot. Do not remove."
+        printf '%s\n' "${DEFAULT_SEARCH_BOT_CIDRS[@]}"
+    } >> "$WHITELIST_FILE" 2>/dev/null || true
+}
+
 load_whitelist() {
     WL_ITEMS=()
-    local line
-    [ -f "$WHITELIST_FILE" ] || return 0
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%%#*}"
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [ -z "$line" ] && continue
-        if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-            WL_ITEMS+=("$line")
-        fi
-    done < "$WHITELIST_FILE"
+    local line cidr
+    ensure_search_bot_whitelist
+    if [ -f "$WHITELIST_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && continue
+            if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+                WL_ITEMS+=("$line")
+            fi
+        done < "$WHITELIST_FILE"
+    fi
+    for cidr in "${DEFAULT_SEARCH_BOT_CIDRS[@]}"; do
+        WL_ITEMS+=("$cidr")
+    done
 }
 
 ip_whitelisted() {
-    local ip="$1" item a b c d
+    local ip="$1" item
     load_self_ips
     [[ -n "${SELF_IPS[$ip]:-}" ]] && return 0
-    IFS=. read -r a b c d <<< "$ip"
     for item in "${WL_ITEMS[@]}"; do
-        [[ "$item" == "$ip" ]] && return 0
-        [[ "$item" == "$a.$b.$c.0/24" ]] && return 0
-        [[ "$item" == "$a.$b.0.0/16" ]] && return 0
+        ip_in_cidr "$ip" "$item" && return 0
     done
     return 1
 }
