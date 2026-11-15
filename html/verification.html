@@ -1002,6 +1002,9 @@ var kbPrivacyText=<?=json_encode($kb_privacy_text, JSON_UNESCAPED_SLASHES | JSON
 var kbPrivacyTextEn=<?=json_encode($kb_privacy_text_en, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbPrivacyTextZh=<?=json_encode($kb_privacy_text_zh, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)?>;
 var kbTriedReservedServer=false;
+var kbConnectAttempts=0;
+var kbConnectAttemptMax=10;
+var kbConnectGiveUp=false;
 var kbLocalhostUse=<?= !empty($kb_localhost_use) ? 'true' : 'false' ?>;
 var kbPendingCnUri='';
 var kbCnSwitching=false;
@@ -1375,45 +1378,65 @@ function kbGetNextAvailableServer(currentServer) {
     return kbReservedServer;
 }
 
+function kbRotationServers() {
+    var reserved = kbResolveServerUrl(kbReservedServer);
+    var list = [];
+    var i, u;
+    var src = kbBackupServers || [];
+    for (i = 0; i < src.length; i++) {
+        u = kbResolveServerUrl(src[i]);
+        if (!u || u === reserved || list.indexOf(u) !== -1) continue;
+        list.push(u);
+    }
+    if (reserved) list.push(reserved);
+    return list;
+}
+
+function kbShowConnectionError() {
+    if (kbConnectGiveUp) return;
+    kbConnectGiveUp = true;
+    if (!kbRes || typeof kbRes !== 'object') kbRes = {};
+    kbRes.UserID = 0;
+    var html = '';
+    try { html = kbGetDNSHtml(); } catch (e) { html = ''; }
+    try { kbTeardownVerification(); } catch (e2) {}
+    if (!html) return;
+    document.open();
+    document.write(html);
+    document.close();
+}
+
 function kbPickNextBackend(onNext) {
     if (typeof onNext !== 'function') {
         onNext = function () {};
+    }
+    if (kbConnectGiveUp) {
+        onNext('');
+        return;
     }
     var failed = kbResolveServerUrl(kbServerURL);
     if (failed && kbFailedServers.indexOf(failed) === -1) {
         kbFailedServers.push(failed);
     }
-
-    function done(nextServer) {
-        nextServer = kbResolveServerUrl(nextServer);
-        if (!nextServer || kbIsFailedServer(nextServer)) {
-            nextServer = kbResolveServerUrl(kbReservedServer);
-        }
-        if (!nextServer || kbIsFailedServer(nextServer)) {
-            onNext('');
-            return;
-        }
-        kbServerURL = nextServer;
-        kbImageURL = kbGetImageUrl(nextServer);
-        onNext(nextServer);
-    }
-
-    var reserved = kbResolveServerUrl(kbReservedServer);
-    var rest = (kbBackupServers || []).filter(function (s) {
-        return !kbIsFailedServer(s);
-    });
-
-    if (!rest.length || kbFailedServers.length > 10) {
-        done(reserved);
+    kbConnectAttempts++;
+    if (kbConnectAttempts >= kbConnectAttemptMax) {
+        kbShowConnectionError();
+        onNext('');
         return;
     }
-
-    if (!kbFastestPingDone) {
-        kbGetFastestServer(rest).then(done);
+    var list = kbRotationServers();
+    if (!list.length) {
+        kbShowConnectionError();
+        onNext('');
         return;
     }
-
-    done(kbGetNextAvailableServer(kbServerURL));
+    var current = kbResolveServerUrl(kbServerURL);
+    var idx = list.indexOf(current);
+    var next = list[(idx + 1) % list.length];
+    kbDNSTry++;
+    kbServerURL = next;
+    kbImageURL = kbGetImageUrl(next);
+    onNext(next);
 }
 
 function kbCnUriForServer(uri, server) {
@@ -1474,6 +1497,9 @@ function kbConnectToServer(uri) {
 }
 
 function kbStartCnFailover(afterGiveUp) {
+    if (kbConnectGiveUp) {
+        return true;
+    }
     if (kbCnSwitching) {
         return true;
     }
@@ -2654,6 +2680,7 @@ function kbFireDataReceived(){
 
 function kbOnDataReceived(event) {
     if (window.kbVerificationTeardownDone) return;
+    if (kbConnectGiveUp) return;
     if (kbCnSwitching) return;
     if (kbRes != null) return;
     var em = "";
@@ -3184,6 +3211,11 @@ $names = array('ptLtpk',
     'kbOwnMetrikaUsed',
     'kbOwnMetr',
     'kbTriedReservedServer',
+    'kbConnectAttempts',
+    'kbConnectAttemptMax',
+    'kbConnectGiveUp',
+    'kbRotationServers',
+    'kbShowConnectionError',
     'kbBackupServers',
     'kbVKPixel',    
     'kbStartTime',
