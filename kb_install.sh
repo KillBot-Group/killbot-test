@@ -2186,6 +2186,16 @@ FILE="/opt/killbot/cert_delete.sh"
         exit 1
     fi
 
+FILE="/opt/killbot/clean_up_unused_certs.sh"
+    kb_download "$FILE" "sh/clean_up_unused_certs.sh"
+
+    if [ $? -eq 0 ]; then
+        echo "clean_up_unused_certs loaded."
+    else
+        echo "Error loading the clean_up_unused_certs."
+        exit 1
+    fi
+
 FILE="/opt/killbot/html/access_denied.html"
 if [ ! -f "$FILE" ]; then
     kb_download "$FILE" "html/access_denied.html"

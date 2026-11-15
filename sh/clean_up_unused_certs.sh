@@ -101,8 +101,13 @@ resolve_domain_ipv4() {
     fi
 }
 
-# 1. Domains from nginx sites-enabled/{domain.ru}.conf and /etc/letsencrypt/live/* (no duplicates)
-#    Skip default, IP names and internal 000-*
+# Technical vhosts. 000-rN.domain.conf is not technical: it follows {domain}.conf.
+is_technical_vhost_name() {
+    echo "$1" | grep -Eq '^(0|00)-'
+}
+
+# 1. Domains from nginx sites-enabled/{domain}.conf and letsencrypt (no duplicates).
+#    Skip default, IP names, 000-* companions, and technical 0-*.conf / 00-*.conf.
 DOMAINS=$(
   {
     for f in /etc/nginx/sites-enabled/*.conf; do
@@ -117,8 +122,9 @@ DOMAINS=$(
       if echo "$name" | grep -Eq '^000'; then
         continue
       fi
-      # solver domain vhost: 00-s1.example.com.conf -> s1.example.com
-      name="${name#00-}"
+      if is_technical_vhost_name "$name"; then
+        continue
+      fi
       echo "$name"
     done
     for d in /etc/letsencrypt/live/*/; do
@@ -128,6 +134,9 @@ DOMAINS=$(
         continue
       fi
       if echo "$name" | grep -Eq '^000'; then
+        continue
+      fi
+      if is_technical_vhost_name "$name"; then
         continue
       fi
       echo "$name"
@@ -172,10 +181,18 @@ for domain in $DOMAINS; do
         ACTION="delete"
     fi
 
-    # Delete the certificate if needed
+    # Delete the certificate if needed. Companion 000-rN.{domain}.conf goes with it.
     if [[ "$ACTION" == "delete"* ]]; then
         #/opt/killbot/cert_delete.sh "$domain" do_not_reload do_not_remove_ssl_path
         /opt/killbot/cert_delete.sh "$domain" do_not_reload
+        for conf in \
+            /etc/nginx/sites-enabled/000-r*."${domain}".conf \
+            /etc/apache2/sites-enabled/000-r*."${domain}".conf
+        do
+            [ -e "$conf" ] || continue
+            sudo rm -f "$conf"
+            echo "  removed $conf"
+        done
     fi
 done
 
