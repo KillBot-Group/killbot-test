@@ -5261,6 +5261,13 @@ fi
 domain_without_www=\${domain#www.}
 domain_with_www="www.\$domain_without_www"
 
+# kb.php saves official_allowed_ip_urls.txt and dns_bots_allowed.txt as www-data.
+mkdir -p /opt/killbot/settings "/opt/killbot/settings/\${domain_without_www}"
+chown www-data:www-data /opt/killbot/settings
+chmod 775 /opt/killbot/settings
+chown -R www-data:www-data "/opt/killbot/settings/\${domain_without_www}"
+chmod 775 "/opt/killbot/settings/\${domain_without_www}"
+
 FILE1="/etc/apache2/sites-enabled/\$domain_without_www-killbot.conf"
 FILE2="/etc/apache2/sites-enabled/\$domain_without_www.conf"
 FILE3="/etc/nginx/sites-enabled/\$domain_without_www.conf"
@@ -7391,7 +7398,7 @@ if (is_file("/opt/killbot/settings.php")) {
     include "/opt/killbot/settings.php";
 }
 \$kb_config_locked = (\$kb_allow_install_sh === false || \$kb_allow_install_sh === 0 || \$kb_allow_install_sh === "0" || \$kb_allow_install_sh === "false");
-\$kb_readonly_types = array("v", "check_host", "health_check", "healf_check", "access_log");
+\$kb_readonly_types = array("v", "check_host", "health_check", "healf_check", "access_log", "blocked_ips");
 if (\$kb_config_locked && !in_array(\$type, \$kb_readonly_types, true)) {
     echo "ERROR: server configuration via kb.php is disabled in /opt/killbot/settings.php (kb_allow_install_sh = false)";
     exit;
@@ -7461,6 +7468,79 @@ if (\$type == "access_log") {
     \$cmd = sprintf('tail -n 1000 %s 2>/dev/null', escapeshellarg(\$log_file));
     \$out = shell_exec(\$cmd);
     echo (\$out === null || \$out === false) ? '' : \$out;
+    exit;
+}
+
+if (\$type == "blocked_ips") {
+    \$kb_ban_seconds = function (\$conf, \$default) {
+        if (!is_file(\$conf) || !is_readable(\$conf)) {
+            return \$default;
+        }
+        \$text = file_get_contents(\$conf);
+        if (!is_string(\$text) || !preg_match('/^BAN_TIME=([0-9]+)/m', \$text, \$m)) {
+            return \$default;
+        }
+        \$seconds = (int) \$m[1];
+        return \$seconds > 0 ? \$seconds : \$default;
+    };
+    \$kb_ban_collect = function (\$file, \$fallback, \$ban_seconds, \$with_mask) {
+        \$path = \$file;
+        if (!is_file(\$path) && is_file(\$fallback)) {
+            \$path = \$fallback;
+        }
+        if (!is_file(\$path)) {
+            return array('items' => array(), 'error' => '');
+        }
+        if (!is_readable(\$path)) {
+            return array('items' => array(), 'error' => 'cannot read ' . \$path);
+        }
+        \$lines = file(\$path, FILE_IGNORE_NEW_LINES);
+        if (!is_array(\$lines)) {
+            return array('items' => array(), 'error' => 'cannot read ' . \$path);
+        }
+        \$now = time();
+        \$items = array();
+        foreach (\$lines as \$line) {
+            \$line = trim(\$line);
+            if (\$line === '') {
+                continue;
+            }
+            \$parts = preg_split('/\s+/', \$line);
+            if (!is_array(\$parts) || count(\$parts) < 2 || !preg_match('/^[0-9]+\$/', \$parts[0])) {
+                continue;
+            }
+            \$until = (int) \$parts[0] + \$ban_seconds;
+            if (\$until <= \$now) {
+                continue;
+            }
+            \$addr = \$parts[1];
+            if (\$with_mask && isset(\$parts[2]) && \$parts[2] !== '' && \$parts[2] !== 'ip' && preg_match('/^[0-9]+\$/', \$parts[2])) {
+                \$addr .= '/' . \$parts[2];
+            }
+            if (!preg_match('/^[0-9.]+(\/[0-9]+)?\$/', \$addr)) {
+                continue;
+            }
+            if (!isset(\$items[\$addr]) || \$items[\$addr] < \$until) {
+                \$items[\$addr] = \$until;
+            }
+        }
+        \$out = array();
+        foreach (\$items as \$addr => \$until) {
+            \$out[] = array('ip' => \$addr, 'until' => \$until);
+        }
+        return array('items' => \$out, 'error' => '');
+    };
+    \$monitor_sec = \$kb_ban_seconds('/opt/killbot/f2b/subnet-monitor.conf', 3600);
+    \$probe_sec = \$kb_ban_seconds('/opt/killbot/f2b/scanner-probe.conf', 86400);
+    \$monitor = \$kb_ban_collect('/var/log/killbot/subnet_bans', '/tmp/subnet_bans', \$monitor_sec, true);
+    \$probe = \$kb_ban_collect('/var/log/killbot/scanner_probe_bans', '/tmp/scanner_probe_bans', \$probe_sec, false);
+    echo json_encode(array(
+        'ok' => 1,
+        'monitor' => \$monitor['items'],
+        'probe' => \$probe['items'],
+        'monitor_error' => \$monitor['error'],
+        'probe_error' => \$probe['error'],
+    ));
     exit;
 }
 
@@ -7557,118 +7637,6 @@ if (\$type == "check_host") {
     exit;
 }
 
-if (\$type == "install") {
-
-// Create the directory if it does not exist
-\$settings_dir = "/opt/killbot/settings/{\$domain_no_www}";
-if (!is_dir(\$settings_dir)) {
-    mkdir(\$settings_dir, 0755, true);
-}
-
-// Path to the file that lists URLs with allowed IPs 
-\$urls_ip_file = \$settings_dir . "/official_allowed_ip_urls.txt";
-
-// Handle saving official_bots_urls
-if (\$domain && !empty(\$official_bots_urls)) {
-    
-    // Split URLs by comma and save each on its own line
-    \$urls = array_map('trim', explode(',', \$official_bots_urls));
-    
-    // Filter empty lines
-    \$urls = array_filter(\$urls, function(\$url) {
-        return !empty(\$url);
-    });
-    
-    // Save to the file (overwrite)
-    \$content = implode("\n", \$urls);
-    if (file_put_contents(\$urls_ip_file, \$content) !== false) {
-        echo "OK: URLs saved to " . \$urls_ip_file . "\n";
-        echo "Saved " . count(\$urls) . " URLs:\n";
-       // print_r(\$urls);
-
-        // Run in the background — PHP does not wait
-        \$log_file = '/var/log/killbot/official_allowed_ips_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', \$domain_no_www) . '.log';
-        \$cmd = sprintf(
-            'nohup /opt/killbot/official_allowed_ips.sh %s >> %s 2>&1 </dev/null &',
-            escapeshellarg(\$domain_no_www),
-            escapeshellarg(\$log_file)
-        );
-        exec(\$cmd);
-        echo "OK: parsing started in background (log: {\$log_file})\n";
-
-    } else {
-        echo "ERROR: Failed to save URLs to " . \$urls_ip_file;
-    }
-}
-
-if (empty(\$official_bots_urls)){
-    if (file_exists(\$urls_ip_file)) {
-        if (unlink(\$urls_ip_file)) {
-            echo "File deleted successfully: \$urls_ip_file";
-        } else {
-            echo "Failed to delete file: \$urls_ip_file";
-        }
-    }
-}
-
-// Path to the file that lists forbidden URL paths (if a regulator requires blocking them)
-\$disallowed_paths_file = \$settings_dir . "/disallowed_paths.txt";
-
-if (\$domain && !empty(\$disallowed_paths)) {
-    
-    // Split paths by comma and save each on its own line
-    \$paths = array_map('trim', explode(',', \$disallowed_paths));
-    
-    // Filter empty lines
-    \$paths = array_filter(\$paths, function(\$path) {
-        return !empty(\$path);
-    });
-    
-    // Save to the file (overwrite)
-    \$content = implode("\n", \$paths);
-    if (file_put_contents(\$disallowed_paths_file, \$content) !== false) {
-        echo "OK: URLs saved to " . \$disallowed_paths_file . "\n";
-        echo "Saved " . count(\$paths) . " paths:\n";
-       // print_r(\$paths);       
-
-    } else {
-        echo "ERROR: Failed to save URLs to " . \$disallowed_paths_file;
-    }
-}
-
-if (empty(\$disallowed_paths)){
-    if (file_exists(\$disallowed_paths_file)) {
-        if (unlink(\$disallowed_paths_file)) {
-            echo "File deleted successfully: \$disallowed_paths_file";
-        } else {
-            echo "Failed to delete file: \$disallowed_paths_filee";
-        }
-    }
-}
-
-\$dns_bots_allowed_file = \$settings_dir . "/dns_bots_allowed.txt";
-
-if (\$domain && !empty(\$dns_bots_allowed)) {
-    
-    if (file_put_contents(\$dns_bots_allowed_file, \$dns_bots_allowed) !== false) {
-        echo "OK: URLs saved to " . \$dns_bots_allowed_file . "\n";
-    } else {
-        echo "ERROR: Failed to save URLs to " . \$dns_bots_allowed_file;
-    }
-}
-
-if (empty(\$dns_bots_allowed)){
-    if (file_exists(\$dns_bots_allowed_file)) {
-        if (unlink(\$dns_bots_allowed_file)) {
-            echo "File deleted successfully: \$dns_bots_allowed_file";
-        } else {
-            echo "Failed to delete file: \$dns_bots_allowed_filee";
-        }
-    }
-}
-
-}
-
 if (\$type == "log_download" || \$type == "log_download_error"){
 
     if (!\$domain_no_www) {
@@ -7752,6 +7720,117 @@ if (\$type == "install"){
 
 \$output = array();
 exec(\$command,\$output,\$return_var);
+
+if (\$type == "install") {
+
+// install.sh has already given these directories to www-data.
+\$settings_dir = "/opt/killbot/settings/{\$domain_no_www}";
+if (!is_dir(\$settings_dir)) {
+    mkdir(\$settings_dir, 0755, true);
+}
+
+\$urls_ip_file = \$settings_dir . "/official_allowed_ip_urls.txt";
+
+// Handle saving official_bots_urls
+if (\$domain && !empty(\$official_bots_urls)) {
+    
+    // Split URLs by comma and save each on its own line
+    \$urls = array_map('trim', explode(',', \$official_bots_urls));
+    
+    // Filter empty lines
+    \$urls = array_filter(\$urls, function(\$url) {
+        return !empty(\$url);
+    });
+    
+    // Save to the file (overwrite)
+    \$content = implode("\n", \$urls);
+    if (file_put_contents(\$urls_ip_file, \$content) !== false) {
+        echo "OK: URLs saved to " . \$urls_ip_file . "\n";
+        echo "Saved " . count(\$urls) . " URLs:\n";
+       // print_r(\$urls);
+
+        // Run in the background — PHP does not wait
+        \$log_file = '/var/log/killbot/official_allowed_ips_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', \$domain_no_www) . '.log';
+        \$cmd = sprintf(
+            'nohup /opt/killbot/official_allowed_ips.sh %s >> %s 2>&1 </dev/null &',
+            escapeshellarg(\$domain_no_www),
+            escapeshellarg(\$log_file)
+        );
+        exec(\$cmd);
+        echo "OK: parsing started in background (log: {\$log_file})\n";
+
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$urls_ip_file . "\n";
+    }
+}
+
+if (empty(\$official_bots_urls)){
+    if (file_exists(\$urls_ip_file)) {
+        if (unlink(\$urls_ip_file)) {
+            echo "File deleted successfully: \$urls_ip_file";
+        } else {
+            echo "Failed to delete file: \$urls_ip_file";
+        }
+    }
+}
+
+// Path to the file that lists forbidden URL paths (if a regulator requires blocking them)
+\$disallowed_paths_file = \$settings_dir . "/disallowed_paths.txt";
+
+if (\$domain && !empty(\$disallowed_paths)) {
+    
+    // Split paths by comma and save each on its own line
+    \$paths = array_map('trim', explode(',', \$disallowed_paths));
+    
+    // Filter empty lines
+    \$paths = array_filter(\$paths, function(\$path) {
+        return !empty(\$path);
+    });
+    
+    // Save to the file (overwrite)
+    \$content = implode("\n", \$paths);
+    if (file_put_contents(\$disallowed_paths_file, \$content) !== false) {
+        echo "OK: URLs saved to " . \$disallowed_paths_file . "\n";
+        echo "Saved " . count(\$paths) . " paths:\n";
+       // print_r(\$paths);       
+
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$disallowed_paths_file . "\n";
+    }
+}
+
+if (empty(\$disallowed_paths)){
+    if (file_exists(\$disallowed_paths_file)) {
+        if (unlink(\$disallowed_paths_file)) {
+            echo "File deleted successfully: \$disallowed_paths_file";
+        } else {
+            echo "Failed to delete file: \$disallowed_paths_filee";
+        }
+    }
+}
+
+\$dns_bots_allowed_file = \$settings_dir . "/dns_bots_allowed.txt";
+
+if (\$domain && !empty(\$dns_bots_allowed)) {
+    
+    if (file_put_contents(\$dns_bots_allowed_file, \$dns_bots_allowed) !== false) {
+        echo "OK: URLs saved to " . \$dns_bots_allowed_file . "\n";
+    } else {
+        echo "ERROR: Failed to save URLs to " . \$dns_bots_allowed_file . "\n";
+    }
+}
+
+if (empty(\$dns_bots_allowed)){
+    if (file_exists(\$dns_bots_allowed_file)) {
+        if (unlink(\$dns_bots_allowed_file)) {
+            echo "File deleted successfully: \$dns_bots_allowed_file";
+        } else {
+            echo "Failed to delete file: \$dns_bots_allowed_filee";
+        }
+    }
+}
+
+}
 
 print_r(\$output);
 ?>

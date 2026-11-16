@@ -75,15 +75,19 @@ fi
 
 BAN_LOG="/var/log/killbot/scanner-probe-block.log"
 UNBAN_LOG="/var/log/killbot/scanner-probe-unban.log"
-BAN_FILE="/tmp/scanner_probe_bans"
+BAN_FILE="/var/log/killbot/scanner_probe_bans"
 IPTABLES_CHAIN="INPUT"
 IPTABLES_COMMENT_TAG="scanner-probe"
 PIDFILE="/tmp/scanner-probe.pid"
 
 mkdir -p /var/log/killbot 2>/dev/null
+if [ ! -s "$BAN_FILE" ] && [ -s /tmp/scanner_probe_bans ]; then
+    cp /tmp/scanner_probe_bans "$BAN_FILE" 2>/dev/null || true
+fi
 [ -f "$BAN_LOG" ] || touch "$BAN_LOG"
 [ -f "$UNBAN_LOG" ] || touch "$UNBAN_LOG"
 [ -f "$BAN_FILE" ] || touch "$BAN_FILE"
+chmod 644 "$BAN_FILE" 2>/dev/null || true
 
 declare -ga WL_ITEMS=()
 declare -gA SELF_IPS=()
@@ -573,6 +577,7 @@ unban_expired() {
         fi
     done < "$BAN_FILE"
     mv "$temp_file" "$BAN_FILE"
+    chmod 644 "$BAN_FILE" 2>/dev/null || true
 }
 
 unban_own_addresses() {
@@ -595,8 +600,8 @@ unban_own_addresses() {
         echo "$now_line" >> "$temp_file"
     done < "$BAN_FILE"
     mv "$temp_file" "$BAN_FILE"
+    chmod 644 "$BAN_FILE" 2>/dev/null || true
 }
-
 run_scan() {
     local count ip sample
     declare -A totals=()

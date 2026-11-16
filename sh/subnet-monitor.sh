@@ -115,8 +115,14 @@ DEBUG_LOG="/var/log/killbot/subnet-debug.log"
 STATS_LOG="/var/log/killbot/subnet-stats.log"
 IPTABLES_CHAIN="INPUT"
 PIDFILE="/tmp/subnet-monitor.pid"
-BAN_FILE="/tmp/subnet_bans"
+BAN_FILE="/var/log/killbot/subnet_bans"
 IPTABLES_COMMENT_TAG="subnet-monitor"
+mkdir -p /var/log/killbot 2>/dev/null
+if [ ! -s "$BAN_FILE" ] && [ -s /tmp/subnet_bans ]; then
+    cp /tmp/subnet_bans "$BAN_FILE" 2>/dev/null || true
+fi
+touch "$BAN_FILE" 2>/dev/null || true
+chmod 644 "$BAN_FILE" 2>/dev/null || true
 
 # One log pass per run: raw IPs in the LOG_WINDOW_SECONDS window (default DEFAULT_LOG_WINDOW_SECONDS)
 # and summary lines "count subnet mask" + associative maps SUBNET_MON_AGG_* (sum over all LOG_FILES).
@@ -411,6 +417,7 @@ unban_old_subnets() {
 
     # Replace the ban file
     mv "$temp_file" "$BAN_FILE"
+    chmod 644 "$BAN_FILE" 2>/dev/null || true
 
     if [ $unban_count -gt 0 ]; then
         echo "$(date): Total subnets unbanned: $unban_count" >> "$UNBAN_LOG"
