@@ -4830,31 +4830,34 @@ fi
 cat > /opt/killbot/install.sh <<EOF
 #!/bin/bash
 
-require_kb_status() {
-    if [[ "\${KB_STATUS_CHECKED:-0}" == "1" ]]; then
-        return 0
-    fi
-    local kb_bin=""
-    if command -v kb >/dev/null 2>&1; then
-        kb_bin="\$(command -v kb)"
-    elif [[ -x /usr/local/bin/kb ]]; then
-        kb_bin="/usr/local/bin/kb"
-    elif [[ -x /etc/init.d/kb ]]; then
-        kb_bin="/etc/init.d/kb"
+require_web_syntax() {
+    local apache_out nginx_out
+
+    echo "Checking Apache and Nginx syntax..."
+    apache_out=\$(apache2ctl configtest 2>&1) || true
+    if echo "\$apache_out" | grep -q "Syntax OK"; then
+        echo "Apache configuration is correct."
     else
-        echo "ERROR: kb is not installed; aborting install.sh" >&2
+        echo "ERROR: Apache configuration is invalid:" >&2
+        echo "\$apache_out" >&2
         exit 1
     fi
-    echo "Checking kb status..."
-    if ! "\$kb_bin" status; then
-        echo "ERROR: kb status failed; aborting install.sh" >&2
+
+    nginx_out=\$(nginx -t 2>&1) || true
+    if echo "\$nginx_out" | grep -q "test is successful"; then
+        echo "Nginx configuration is correct."
+    else
+        echo "ERROR: Nginx configuration is invalid:" >&2
+        echo "\$nginx_out" >&2
         exit 1
     fi
+
+    # Child scripts (setup_killbot_reverse_proxy.sh) skip the slow "kb status" wait.
     KB_STATUS_CHECKED=1
     export KB_STATUS_CHECKED
 }
 
-require_kb_status
+require_web_syntax
 
 sudo a2enmod setenvif >/dev/null 2>&1 || true
 sudo tee /etc/apache2/conf-available/killbot-logformat.conf > /dev/null <<'KBLOGFMT'
