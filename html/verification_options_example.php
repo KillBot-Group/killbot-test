@@ -1,7 +1,7 @@
 <?php
 // TEMPLATE ONLY. verification.php does not load this file.
 // Overwritten on every kb_install update.
-// Copy new keys from here into verification_options.php.
+// kb_install.sh appends any of these keys that are missing from verification_options.php.
 return;
 
 // Domains that must decode HTML as windows-1251

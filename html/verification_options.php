@@ -1,7 +1,7 @@
 <?php
 // Optional verification-page settings.
-// This file is installed once and is not overwritten on update if it already exists.
-// New keys after an update are listed in verification_options_example.php.
+// Installed once. An update does not replace values already set in this file.
+// kb_install.sh appends variables that this file does not have yet.
 
 // Domains that must decode HTML as windows-1251
 $kb_windows_1251_domains = [

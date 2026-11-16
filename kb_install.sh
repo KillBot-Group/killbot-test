@@ -1899,17 +1899,172 @@ else
     exit 1
 fi
 
-FILE="/opt/killbot/html/verification_options.php"
-if [ ! -f "$FILE" ]; then
-    kb_download "$FILE" "html/verification_options.php"
-    if [ $? -eq 0 ]; then
-        echo "The verification options have been successfully loaded."
+# Keep an existing verification_options.php. Append assignments that the
+# current version has and this file does not, the same way settings.php
+# gains new variables. Values already set by the client stay as they are.
+kb_append_missing_php_vars() {
+    local fresh="$1"
+    local dest="$2"
+    local merger added
+    merger=$(mktemp /tmp/kb_merge_opts.XXXXXX)
+    cat > "$merger" <<'PHP'
+<?php
+$fresh = $argv[1];
+$dest = $argv[2];
+$src = file_get_contents($fresh);
+$dst = file_get_contents($dest);
+if ($src === false || $dst === false) {
+    fwrite(STDERR, "ERROR: cannot read verification options\n");
+    exit(1);
+}
+
+function kb_assigned_names($code) {
+    $names = array();
+    $tokens = token_get_all($code);
+    $n = count($tokens);
+    for ($i = 0; $i < $n; $i++) {
+        $t = $tokens[$i];
+        if (!is_array($t) || $t[0] !== T_VARIABLE) {
+            continue;
+        }
+        $j = $i + 1;
+        while ($j < $n && is_array($tokens[$j]) && in_array($tokens[$j][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+            $j++;
+        }
+        if ($j < $n && $tokens[$j] === '=') {
+            $names[substr($t[1], 1)] = true;
+        }
+    }
+    return $names;
+}
+
+function kb_token_text($t) {
+    return is_array($t) ? $t[1] : $t;
+}
+
+$have = kb_assigned_names($dst);
+$tokens = token_get_all($src);
+$n = count($tokens);
+$starts = array();
+$cursor = 0;
+for ($i = 0; $i < $n; $i++) {
+    $starts[$i] = $cursor;
+    $cursor += strlen(kb_token_text($tokens[$i]));
+}
+
+$blocks = array();
+$added_names = array();
+$seen = array();
+$depth = 0;
+for ($i = 0; $i < $n; $i++) {
+    $t = $tokens[$i];
+    if ($t === '{') {
+        $depth++;
+        continue;
+    }
+    if ($t === '}') {
+        if ($depth > 0) {
+            $depth--;
+        }
+        continue;
+    }
+    if ($depth !== 0 || !is_array($t) || $t[0] !== T_VARIABLE) {
+        continue;
+    }
+    $j = $i + 1;
+    while ($j < $n && is_array($tokens[$j]) && in_array($tokens[$j][0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+        $j++;
+    }
+    if ($j >= $n || $tokens[$j] !== '=') {
+        continue;
+    }
+    $name = substr($t[1], 1);
+    $sq = 0;
+    $pa = 0;
+    $cu = 0;
+    $end = null;
+    for ($k = $j + 1; $k < $n; $k++) {
+        $tk = $tokens[$k];
+        if ($tk === '[') { $sq++; continue; }
+        if ($tk === ']') { if ($sq > 0) { $sq--; } continue; }
+        if ($tk === '(') { $pa++; continue; }
+        if ($tk === ')') { if ($pa > 0) { $pa--; } continue; }
+        if ($tk === '{') { $cu++; continue; }
+        if ($tk === '}') { if ($cu > 0) { $cu--; } continue; }
+        if ($tk === ';' && $sq === 0 && $pa === 0 && $cu === 0) {
+            $end = $starts[$k] + 1;
+            break;
+        }
+    }
+    if ($end === null || isset($seen[$name])) {
+        continue;
+    }
+    $seen[$name] = true;
+    if (isset($have[$name])) {
+        continue;
+    }
+    $from = $starts[$i];
+    for ($p = $i - 1; $p >= 0; $p--) {
+        $prev = $tokens[$p];
+        if (is_array($prev) && in_array($prev[0], array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT), true)) {
+            $from = $starts[$p];
+            continue;
+        }
+        break;
+    }
+    $block = ltrim(substr($src, $from, $end - $from), "\r\n");
+    if ($block === '') {
+        continue;
+    }
+    $blocks[] = $block;
+    $added_names[] = '$' . $name;
+}
+
+if (count($blocks) > 0) {
+    if ($dst !== '' && substr($dst, -1) !== "\n") {
+        $dst .= "\n";
+    }
+    $dst .= "\n" . implode("\n\n", $blocks);
+    if (substr($dst, -1) !== "\n") {
+        $dst .= "\n";
+    }
+    if (file_put_contents($dest, $dst, LOCK_EX) === false) {
+        fwrite(STDERR, "ERROR: cannot write $dest\n");
+        exit(1);
+    }
+}
+echo implode(' ', $added_names);
+PHP
+    if ! added=$(php -d display_errors=stderr "$merger" "$fresh" "$dest"); then
+        rm -f "$merger"
+        echo "ERROR: failed to add missing verification options to $dest" >&2
+        return 1
+    fi
+    rm -f "$merger"
+    added="${added//$'\r'/}"
+    added="${added//$'\n'/ }"
+    if [ -n "$added" ]; then
+        echo "Added to $dest: $added"
     else
-        echo "Error loading the verification options."
+        echo "Keep existing settings: $dest"
+    fi
+}
+
+FILE="/opt/killbot/html/verification_options.php"
+UPSTREAM="/tmp/kb_verification_options_upstream.php"
+if ! kb_download "$UPSTREAM" "html/verification_options.php"; then
+    echo "Error loading the verification options."
+    exit 1
+fi
+if [ ! -s "$FILE" ]; then
+    mv "$UPSTREAM" "$FILE"
+    echo "The verification options have been successfully loaded."
+else
+    if ! kb_append_missing_php_vars "$UPSTREAM" "$FILE"; then
+        rm -f "$UPSTREAM"
         exit 1
     fi
-else
-    echo "Keep existing settings: $FILE"
+    rm -f "$UPSTREAM"
 fi
 
 FILE="/opt/killbot/html/verification_options_example.php"
@@ -7392,7 +7547,7 @@ if (!\$type) {
 }
 
 if (\$type=="v"){
-    echo "3.78"; 
+    echo "3.79"; 
     exit;
 }
 
