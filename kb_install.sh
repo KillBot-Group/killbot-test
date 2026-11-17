@@ -5976,10 +5976,13 @@ sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\
 sed -e "s|\*\*\*SubdomainAlias\*\*\*|\$subdomain_alias|g" -e "s|\*\*\*server_ip\*\*\*|\$SERVER_IP|g" -e "s|\*\*\*SSLCertificateFile\*\*\*|\$SSLCertificateFile|g" -e "s|\*\*\*SSLCertificateKeyFile\*\*\*|\$SSLCertificateKeyFile|g"  /opt/killbot/apache443.sh > /opt/killbot/sh/\$domain_without_www.sh
 
 #Disable SSL if the domain does not have "www"
+# * must be escaped: sed treats it as "repeat", so ***www_ssl_on*** would stay in the file.
 if [[ "\$ip_without_www_list" == "\$ip_with_www_list" && -n "\$ip_without_www_list" ]]; then
-    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /opt/killbot/sh/\$domain_without_www-killbot.sh    
+    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /opt/killbot/sh/\$domain_without_www-killbot.sh
+    sed -i "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" /opt/killbot/sh/\$domain_without_www.sh
 else
-    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /opt/killbot/sh/\$domain_without_www-killbot.sh    
+    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /opt/killbot/sh/\$domain_without_www-killbot.sh
+    sed -i "s|\*\*\*www_ssl_on\*\*\*||g" /opt/killbot/sh/\$domain_without_www.sh
 fi
 
 sudo chmod +x /opt/killbot/sh/\$domain_without_www-killbot.sh /opt/killbot/sh/\$domain_without_www.sh
@@ -6017,11 +6020,12 @@ else
     exit 1
 fi
 
-# Disable SSL if the domain does not have www
+# Disable SSL if the domain does not have www.
+# Same escaped pattern as above: an unescaped * does not match the placeholder.
 if [[ "\$ip_without_www_list" == "\$ip_with_www_list" && -n "\$ip_without_www_list" ]]; then
-    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|***www_ssl_on***|SSLEngine on|g"
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|\*\*\*www_ssl_on\*\*\*|SSLEngine on|g" || exit 1
 else
-    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|***www_ssl_on***||g"
+    kb_sed_file "/etc/apache2/sites-available/\$domain_without_www.conf" -e "s|\*\*\*www_ssl_on\*\*\*||g" || exit 1
 fi
 
 if [ "\$backend_ip" != "localhost" ]; then
