@@ -2106,8 +2106,8 @@ $kb_le_letsencrypt_dir = '/etc/letsencrypt';
 $kb_le_remove_local_letsencrypt = true;
 
 // Inline /opt/killbot/html/cn.js into the verification page.
-// false = browser fetches /js/cn.js over HTTP as before.
-$kb_inline_cn_js = false;
+// true = put the script in the page. false = browser fetches /js/cn.js over HTTP.
+$kb_inline_cn_js = true;
 
 // Rewrite /opt/killbot/killbot_revers (shared backend list) on kb_install.sh.
 // true = replace with the installer default list. false = keep the current file.
@@ -2127,8 +2127,8 @@ if [ -f /opt/killbot/settings.php ] && ! grep -q 'kb_inline_cn_js' /opt/killbot/
 cat >> /opt/killbot/settings.php <<'EOF'
 
 // Inline /opt/killbot/html/cn.js into the verification page.
-// false = browser fetches /js/cn.js over HTTP as before.
-$kb_inline_cn_js = false;
+// true = put the script in the page. false = browser fetches /js/cn.js over HTTP.
+$kb_inline_cn_js = true;
 EOF
     echo "Added kb_inline_cn_js to /opt/killbot/settings.php"
 fi
@@ -2173,10 +2173,7 @@ else
     cat > /opt/killbot/killbot_revers <<'EOC'
 10052024.ru
 r1.kill-bot.ru
-data.killbot.ru
 r3.nl.kill-bot.ru
-r4.us.kill-bot.ru
-r6.sg.kill-bot.net
 EOC
     chmod 644 /opt/killbot/killbot_revers
     echo "Wrote /opt/killbot/killbot_revers with default Killbot backends"
