@@ -380,16 +380,19 @@ ip_whitelisted() {
     return 1
 }
 
-if [ -f "$PIDFILE" ]; then
-    OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "$(date): scanner-probe already running (PID: $OLD_PID), exiting"
-        exit 1
+# show and clear must work while a scan is running. They must not take or clear its lock.
+if [ "${1:-}" != "show" ] && [ "${1:-}" != "clear" ]; then
+    if [ -f "$PIDFILE" ]; then
+        OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "$(date): scanner-probe already running (PID: $OLD_PID), exiting"
+            exit 1
+        fi
+        rm -f "$PIDFILE"
     fi
-    rm -f "$PIDFILE"
+    echo $$ > "$PIDFILE"
+    trap 'rm -f "$PIDFILE"' EXIT
 fi
-echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT
 
 get_last_log_timestamp() {
     local log_file="$1" last_line last_date ts
@@ -435,7 +438,11 @@ count_probes() {
             }
             function probe_hit(uri) {
                 if (uri == "" || uri == "/") return 0
-                if (index(uri, "..") || index(uri, "%2e%2e") || index(uri, "%252e")) return 1
+                # ../ is a probe. A file named photo..jpg is not.
+                if (index(uri, "../") || index(uri, "..\\")) return 1
+                if (uri ~ /(^|\/)\.\.($|\/)/) return 1
+                if (index(uri, "%2e%2e/") || index(uri, "%2e%2e%2f") || index(uri, "%2e%2e%5c")) return 1
+                if (index(uri, "%252e%252e/") || index(uri, "%252e%252e%2f") || index(uri, "%252e%252e%252f")) return 1
                 if (index(uri, "/etc/passwd") || index(uri, "/etc/shadow")) return 1
                 if (index(uri, "/.git") || index(uri, "/.svn") || index(uri, "/.hg") || index(uri, "/.bzr")) return 1
                 if (index(uri, "/.env") || index(uri, "/.aws/") || index(uri, "/.ssh/") || index(uri, "/.kube/")) return 1
@@ -653,6 +660,49 @@ show_bans() {
     sudo iptables -L "$IPTABLES_CHAIN" --line-numbers -n -v 2>/dev/null | grep -F "$IPTABLES_COMMENT_TAG" || echo "  (none)"
 }
 
+clear_one_ban() {
+    local ip="$1" rule_num removed=0 now_line ban_time file_ip temp_file found=0
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Not an IPv4 address: $ip"
+        exit 1
+    fi
+    temp_file=$(mktemp)
+    if [ -f "$BAN_FILE" ]; then
+        while IFS= read -r now_line; do
+            [ -z "$now_line" ] && continue
+            ban_time=$(echo "$now_line" | awk '{print $1}')
+            file_ip=$(echo "$now_line" | awk '{print $2}')
+            if [ "$file_ip" = "$ip" ]; then
+                echo "0 $ip" >> "$temp_file"
+                found=1
+            else
+                echo "$now_line" >> "$temp_file"
+            fi
+        done < "$BAN_FILE"
+    fi
+    if [ "$found" -eq 1 ]; then
+        mv "$temp_file" "$BAN_FILE"
+        chmod 644 "$BAN_FILE" 2>/dev/null || true
+    else
+        rm -f "$temp_file"
+    fi
+    while true; do
+        rule_num=$(our_rule_number "$ip")
+        [ -z "$rule_num" ] && break
+        if sudo iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null; then
+            removed=$((removed + 1))
+        else
+            break
+        fi
+    done
+    if [ "$found" -eq 0 ] && [ "$removed" -eq 0 ]; then
+        echo "$ip is not banned"
+        return 0
+    fi
+    echo "$(date): Cleared ban for $ip" >> "$UNBAN_LOG"
+    echo "Cleared $ip (iptables rules removed: $removed)"
+}
+
 clear_bans() {
     local rules rule_num ip deleted=0
     echo "Clearing scanner-probe bans..."
@@ -696,13 +746,17 @@ case "$1" in
         show_bans
         ;;
     clear)
-        clear_bans
+        if [ -n "${2:-}" ]; then
+            clear_one_ban "$2"
+        else
+            clear_bans
+        fi
         ;;
     test)
         test_scan
         ;;
     *)
-        echo "Usage: $0 {run|test|show|clear}"
+        echo "Usage: $0 {run|test|show|clear [ip]}"
         exit 1
         ;;
 esac
