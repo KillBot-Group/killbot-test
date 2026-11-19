@@ -3,9 +3,11 @@ set -e
 
 CONFIG="/opt/killbot/f2b/block_all_countries_except.config"
 IPSET_NAME="country-whitelist"
-TMP_DIR="/tmp/ipdeny"
+CACHE_ROOT="/var/cache/killbot/ipdeny"
+TODAY="$(date +%Y-%m-%d)"
+TODAY_DIR="$CACHE_ROOT/$TODAY"
 
-mkdir -p "$TMP_DIR"
+mkdir -p "$TODAY_DIR"
 
 source "$CONFIG"
 
@@ -21,10 +23,16 @@ IFS=',' read -ra COUNTRY_LIST <<< "$COUNTRIES"
 
 for COUNTRY in "${COUNTRY_LIST[@]}"; do
     COUNTRY="$(echo "$COUNTRY" | tr '[:upper:]' '[:lower:]' | xargs)"
-    ZONE_FILE="$TMP_DIR/$COUNTRY.zone"
+    ZONE_FILE="$TODAY_DIR/$COUNTRY.zone"
 
-    echo "[*] Download $COUNTRY"
-    wget -q -O "$ZONE_FILE" "http://www.ipdeny.com/ipblocks/data/countries/$COUNTRY.zone"
+    if [ -s "$ZONE_FILE" ]; then
+        echo "[*] Use cached $COUNTRY ($TODAY)"
+    else
+        echo "[*] Download $COUNTRY"
+        TMP_ZONE="$(mktemp)"
+        wget -q -O "$TMP_ZONE" "http://www.ipdeny.com/ipblocks/data/countries/$COUNTRY.zone"
+        mv "$TMP_ZONE" "$ZONE_FILE"
+    fi
 
     while read -r NET; do
         [ -n "$NET" ] && ipset add "$IPSET_NAME" "$NET" 2>/dev/null || true

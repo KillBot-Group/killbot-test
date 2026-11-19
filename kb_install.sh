@@ -604,9 +604,9 @@ if [ -f /opt/killbot/f2b/scanner-probe.sh ]; then
 fi
 
 # unblock traffic if anything is still blocked
-if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
-  chmod +x /opt/killbot/f2b/unblock_traffic.sh 2>/dev/null || true
-  bash /opt/killbot/f2b/unblock_traffic.sh || true
+if [ -f /opt/killbot/f2b/unblock_all_countries.sh ]; then
+  chmod +x /opt/killbot/f2b/unblock_all_countries.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/unblock_all_countries.sh || true
 fi
 
 sudo apt install -y needrestart
@@ -1040,13 +1040,14 @@ EOF
     echo "SQL injection nginx rules: /etc/nginx/conf.d/sql_injection.conf"
 }
 
-# Block download of .svn, .git and other hidden paths. ACME stays reachable.
+# Block download of .svn, .git and other hidden paths.
+# ACME and Bitrix template folder .default stay reachable.
 kb_write_block_hidden_files_snippet() {
     sudo mkdir -p /etc/nginx/snippets
     sudo tee /etc/nginx/snippets/block-hidden-files.conf >/dev/null << 'EOF'
 # Block hidden files and directories, including nested paths.
-# Keep ACME challenges accessible.
-location ~ (^|/)\.(?!well-known(?:/|$)) {
+# Keep ACME challenges, Bitrix .default folders, and .json paths accessible.
+location ~ (^|/)\.(?!well-known(?:/|$)|default(?:/|$)|json(?:/|$)) {
     return 403;
 }
 EOF
@@ -2297,13 +2298,14 @@ FILE="/opt/killbot/f2b/scanner-probe.sh"
         exit 1
     fi
 
-FILE="/opt/killbot/f2b/unblock_traffic.sh"
-    kb_download "$FILE" "sh/unblock_traffic.sh"
+FILE="/opt/killbot/f2b/unblock_all_countries.sh"
+    kb_download "$FILE" "sh/unblock_all_countries.sh"
 
     if [ $? -eq 0 ]; then
-        echo "unblock_traffic loaded."
+        echo "unblock_all_countries loaded."
+        rm -f /opt/killbot/f2b/unblock_traffic.sh
     else
-        echo "Error loading the unblock_traffic.sh"
+        echo "Error loading the unblock_all_countries.sh"
         exit 1
     fi
 
@@ -2485,7 +2487,7 @@ for f in \
     /opt/killbot/cert_delete.sh \
     /opt/killbot/f2b/block_all_countries_except.sh \
     /opt/killbot/f2b/check_apache_and_block.sh \
-    /opt/killbot/f2b/unblock_traffic.sh
+    /opt/killbot/f2b/unblock_all_countries.sh
 do
     if [ -e "$f" ]; then
         sudo chmod +x "$f" || true
@@ -8086,8 +8088,9 @@ echo "# Clean unuser certs for KillBot
 * * * * * root /opt/killbot/f2b/subnet-monitor.sh run >> /var/log/killbot/subnet-monitor-cron-run.log
 30 */2 * * * root /opt/killbot/f2b/subnet-monitor.sh clear >> /var/log/killbot/subnet-monitor-cron-clear.log
 # scanner-404.sh is not scheduled: 404 counts also match a search bot re-crawling removed pages
-* * * * * root /opt/killbot/f2b/scanner-probe.sh run >> /var/log/killbot/scanner-probe-cron-run.log
-3 */3 * * * root /opt/killbot/f2b/unblock_traffic.sh >> /var/log/killbot/unblock_traffic.log
+# Every 5 minutes. A full log scan is heavy, so a 1-minute cron overlaps itself.
+*/5 * * * * root /opt/killbot/f2b/scanner-probe.sh run >> /var/log/killbot/scanner-probe-cron-run.log
+3 */3 * * * root /opt/killbot/f2b/unblock_all_countries.sh >> /var/log/killbot/unblock_all_countries.log
 0 0 * * * root /opt/killbot/official_allowed_ips.sh >> /var/log/killbot/official_allowed_ips.log 2>&1
 */20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-apache-20min.status /etc/logrotate.d/apache2
 */20 * * * * root /usr/sbin/logrotate -s /var/lib/logrotate-nginx-20min.status /etc/logrotate.d/nginx
@@ -8112,9 +8115,9 @@ if [ -f /opt/killbot/f2b/scanner-probe.sh ]; then
 fi
 
 # unblock traffic if anything is still blocked
-if [ -f /opt/killbot/f2b/unblock_traffic.sh ]; then
-  chmod +x /opt/killbot/f2b/unblock_traffic.sh 2>/dev/null || true
-  bash /opt/killbot/f2b/unblock_traffic.sh || true
+if [ -f /opt/killbot/f2b/unblock_all_countries.sh ]; then
+  chmod +x /opt/killbot/f2b/unblock_all_countries.sh 2>/dev/null || true
+  bash /opt/killbot/f2b/unblock_all_countries.sh || true
 fi
 
 echo "KillBot cron file: $CRON_FILE"

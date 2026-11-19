@@ -271,6 +271,11 @@ validate_access_logs_format() {
         if [ ! -s "$f" ]; then
             continue
         fi
+        # Rotated gzip archives are not the live access log. Skip by name so
+        # grep does not scan the compressed file.
+        case "$f" in
+            *.gz|*.gz-*|*.gzip|*.bz2|*.xz) continue ;;
+        esac
 
         sample=$(grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$f" 2>/dev/null) || sample=""
         if [ -z "$sample" ] || ! echo "$sample" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ - - \[[0-9]{2}/[A-Za-z]{3}/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2} [+-][0-9]{4}\]'; then
