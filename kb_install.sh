@@ -1041,13 +1041,13 @@ EOF
 }
 
 # Block download of .svn, .git and other hidden paths.
-# ACME and Bitrix template folder .default stay reachable.
+# ACME and Bitrix .default and .tmb folders stay reachable.
 kb_write_block_hidden_files_snippet() {
     sudo mkdir -p /etc/nginx/snippets
     sudo tee /etc/nginx/snippets/block-hidden-files.conf >/dev/null << 'EOF'
 # Block hidden files and directories, including nested paths.
-# Keep ACME challenges, Bitrix .default folders, and .json paths accessible.
-location ~ (^|/)\.(?!well-known(?:/|$)|default(?:/|$)|json(?:/|$)) {
+# Keep ACME challenges, Bitrix .default and .tmb folders, and .json paths accessible.
+location ~ (^|/)\.(?!well-known(?:/|$)|default(?:/|$)|json(?:/|$)|tmb(?:/|$)) {
     return 403;
 }
 EOF
@@ -1860,7 +1860,7 @@ if [ ! -f /opt/killbot/f2b/block_all_countries_except.config ]; then
 # Set a country code (for example RU, US, DE, FR, etc.)
 # You can list several countries separated by commas: COUNTRY="RU,BY,GE"
 COUNTRIES="RU,BY"
-PORTS="443,80,22"
+PORTS="443,80,22,1984"
 EOC
 fi
 
@@ -4358,7 +4358,9 @@ cert_del() {
         exit 1
     fi
 
-    "\$KILLBOT_CERT_DELETE_SCRIPT" "\$domain"
+    check_apache_config
+
+    "\$KILLBOT_CERT_DELETE_SCRIPT" "\$domain" || exit 1
     echo "Certificate deleted for domain \$domain."
 }
 
@@ -7550,7 +7552,7 @@ if (!\$type) {
 }
 
 if (\$type=="v"){
-    echo "3.79"; 
+    echo "4.01"; 
     exit;
 }
 

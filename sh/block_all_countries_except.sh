@@ -11,6 +11,16 @@ mkdir -p "$TODAY_DIR"
 
 source "$CONFIG"
 
+# 1984 is allowed with 22, 80 and 443. An older config file may not list it yet.
+PREV_PORTS="$PORTS"
+case ",${PORTS}," in
+    *,1984,*) ;;
+    *)
+        PORTS="${PORTS},1984"
+        sed -i "s/^PORTS=.*/PORTS=\"${PORTS}\"/" "$CONFIG"
+        ;;
+esac
+
 echo "[*] Countries: $COUNTRIES"
 echo "[*] Ports: $PORTS"
 
@@ -44,10 +54,13 @@ ipset list "$IPSET_NAME" | grep "Number of entries"
 
 # ---- IPTABLES ----
 
-# Remove old rules
+# Remove old rules. Also drop the previous port list, so a run that
+# just added 1984 does not leave the old 22,80,443 rules in place.
 iptables -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-iptables -D INPUT -p tcp -m multiport --dports "$PORTS" -m set --match-set "$IPSET_NAME" src -j ACCEPT 2>/dev/null || true
-iptables -D INPUT -p tcp -m multiport --dports "$PORTS" -j DROP 2>/dev/null || true
+for p in "$PORTS" "$PREV_PORTS"; do
+    iptables -D INPUT -p tcp -m multiport --dports "$p" -m set --match-set "$IPSET_NAME" src -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p tcp -m multiport --dports "$p" -j DROP 2>/dev/null || true
+done
 
 # Add in the correct order
 iptables -I INPUT 1 -p tcp -m multiport --dports "$PORTS" -j DROP

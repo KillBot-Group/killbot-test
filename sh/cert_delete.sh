@@ -4,31 +4,24 @@
 #   sudo ./delete_cert.sh example.com
 #   sudo ./delete_cert.sh example.com do_not_reload do_not_remove_ssl_path
 
-require_kb_status() {
-    if [[ "${KB_STATUS_CHECKED:-0}" == "1" ]]; then
-        return 0
-    fi
-    local kb_bin=""
-    if command -v kb >/dev/null 2>&1; then
-        kb_bin="$(command -v kb)"
-    elif [[ -x /usr/local/bin/kb ]]; then
-        kb_bin="/usr/local/bin/kb"
-    elif [[ -x /etc/init.d/kb ]]; then
-        kb_bin="/etc/init.d/kb"
-    else
-        echo "ERROR: kb is not installed; aborting $(basename "$0")" >&2
+# Syntax only. kb status also waits on the network and is not needed to delete a certificate.
+check_apache_nginx_syntax() {
+    local apache_out nginx_out
+    apache_out=$(apache2ctl configtest 2>&1) || true
+    if ! echo "$apache_out" | grep -q "Syntax OK"; then
+        echo "Apache configuration test failed." >&2
+        echo "$apache_out" >&2
         exit 1
     fi
-    echo "Checking kb status..."
-    if ! "$kb_bin" status; then
-        echo "ERROR: kb status failed; aborting $(basename "$0")" >&2
+    nginx_out=$(nginx -t 2>&1) || true
+    if ! echo "$nginx_out" | grep -q "test is successful"; then
+        echo "Nginx configuration test failed." >&2
+        echo "$nginx_out" >&2
         exit 1
     fi
-    KB_STATUS_CHECKED=1
-    export KB_STATUS_CHECKED
 }
 
-require_kb_status
+check_apache_nginx_syntax
 
 check_nginx() {
     if command -v nginx &> /dev/null; then
