@@ -184,21 +184,21 @@ kb_enable_ondrej_php_ppa() {
     sudo add-apt-repository -y universe || true
     if ! sudo add-apt-repository -y ppa:ondrej/php; then
         echo "WARNING: could not add ppa:ondrej/php; trying Ubuntu packages only."
-        sudo apt-get update -y || true
+        sudo apt-get update -y --allow-releaseinfo-change || true
         return 1
     fi
-    if sudo apt-get update -y; then
+    if sudo apt-get update -y --allow-releaseinfo-change; then
         echo "ppa:ondrej/php is enabled."
         return 0
     fi
     echo "WARNING: ppa:ondrej/php has no packages for Ubuntu ${OS_VERSION}; using noble."
-    if kb_php_rewrite_ondrej_suite noble && sudo apt-get update -y; then
+    if kb_php_rewrite_ondrej_suite noble && sudo apt-get update -y --allow-releaseinfo-change; then
         echo "ppa:ondrej/php is enabled (noble packages on Ubuntu ${OS_VERSION})."
         return 0
     fi
     echo "WARNING: ppa:ondrej/php noble packages failed to load; removing it."
     sudo add-apt-repository -y --remove ppa:ondrej/php || true
-    sudo apt-get update -y || true
+    sudo apt-get update -y --allow-releaseinfo-change || true
     return 1
 }
 
@@ -541,7 +541,7 @@ kb_enable_nginx_official_repo() {
     fi
     echo "deb [signed-by=${keyring}] https://nginx.org/packages/ubuntu ${codename} nginx" | sudo tee "$listfile" >/dev/null
     printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' | sudo tee "$pinfile" >/dev/null
-    sudo apt-get update -y
+    sudo apt-get update -y --allow-releaseinfo-change
     echo "nginx.org stable repo enabled (${codename})."
 }
 
@@ -609,7 +609,14 @@ $nrconf{kernelhints} = 0;
 $nrconf{ucodehints} = 0;
 NREOF
 
-sudo apt update
+# ondrej/php changed its InRelease Label to "PPA for PHP (deprecated)".
+# apt stops until that change is accepted. The flag accepts a Label change only.
+sudo mkdir -p /etc/apt/apt.conf.d
+sudo tee /etc/apt/apt.conf.d/99killbot-allow-releaseinfo-label >/dev/null <<'EOF'
+APT::Get::AllowReleaseInfoChange::Label "true";
+EOF
+
+sudo apt update --allow-releaseinfo-change
 
 rm -rf /var/log/apache2/*
 rm -rf /var/log/killbot/*
@@ -705,7 +712,7 @@ else
     exit 1
 fi
 
-sudo apt update -y
+sudo apt update -y --allow-releaseinfo-change
 
 sudo apt install -y apache2 software-properties-common ca-certificates gnupg
 kb_install_patched_php
