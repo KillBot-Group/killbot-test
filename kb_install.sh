@@ -496,8 +496,10 @@ kb_install_patched_php() {
     kb_apache_restart
 }
 
-# Distro nginx on Ubuntu 22.04 is 1.18 (critical CVEs). Official stable is 1.30.x
-# (http2 on; not listen ... ssl http2). Skip if already 1.26+.
+# Distro nginx on Ubuntu 22.04 is 1.18. 1.30.6 and older are missing the
+# 1.30.7 fixes (HTTP/2 memory corruption, HTTP/2 use-after-free, SSL body loop).
+# Minimum is 1.30.7. A newer stable build is accepted. Existing /etc/nginx stays.
+KB_NGINX_MIN="1.30.7"
 kb_nginx_version() {
     nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
@@ -505,7 +507,7 @@ kb_nginx_version() {
 kb_nginx_is_current() {
     local ver="$1"
     [[ -n "$ver" ]] || return 1
-    dpkg --compare-versions "$ver" ge "1.26.0"
+    dpkg --compare-versions "$ver" ge "$KB_NGINX_MIN"
 }
 
 kb_nginx_ubuntu_codename() {
@@ -555,22 +557,45 @@ kb_nginx_ensure_sites_enabled() {
     fi
 }
 
+kb_nginx_install_pkg() {
+    local debver base best=""
+    while read -r debver; do
+        [ -n "$debver" ] || continue
+        base="${debver%%-*}"
+        if dpkg --compare-versions "$base" ge "$KB_NGINX_MIN"; then
+            if [ -z "$best" ] || dpkg --compare-versions "$base" gt "${best%%-*}"; then
+                best="$debver"
+            fi
+        fi
+    done < <(apt-cache madison nginx 2>/dev/null | awk '{print $3}')
+    if [ -z "$best" ]; then
+        echo "ERROR: nginx.org has no nginx package >= ${KB_NGINX_MIN}." >&2
+        apt-cache madison nginx >&2 || true
+        return 1
+    fi
+    echo "Installing nginx ${best}. Existing /etc/nginx (sites-available, sites-enabled, conf.d) is kept."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o Dpkg::Options::="--force-confold" \
+        -o Dpkg::Options::="--force-confdef" \
+        install "nginx=${best}"
+}
+
 kb_install_current_nginx() {
     local ver
     ver="$(kb_nginx_version)"
     if kb_nginx_is_current "$ver"; then
-        echo "nginx ${ver} is new enough (need 1.26+). Skipping nginx.org repo."
+        echo "nginx ${ver} is ${KB_NGINX_MIN} or newer. Skipping package install."
         kb_nginx_ensure_sites_enabled
         return 0
     fi
 
-    echo "nginx ${ver:-not installed} is outdated (Ubuntu 22.04 ships 1.18 with critical CVEs). Installing official stable from nginx.org..."
+    echo "nginx ${ver:-not installed} is below ${KB_NGINX_MIN}. Installing official stable from nginx.org..."
     kb_enable_nginx_official_repo
-    sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confold" install nginx
+    kb_nginx_install_pkg
     kb_nginx_ensure_sites_enabled
     ver="$(kb_nginx_version)"
     if ! kb_nginx_is_current "$ver"; then
-        echo "ERROR: nginx ${ver:-not installed} is still below 1.26 after the official-repo install." >&2
+        echo "ERROR: nginx ${ver:-not installed} is still below ${KB_NGINX_MIN} after the official-repo install." >&2
         nginx -v >&2 || true
         exit 1
     fi
