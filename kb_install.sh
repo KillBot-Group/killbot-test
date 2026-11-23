@@ -499,6 +499,7 @@ kb_install_patched_php() {
 # Distro nginx on Ubuntu 22.04 is 1.18. 1.30.6 and older are missing the
 # 1.30.7 fixes (HTTP/2 memory corruption, HTTP/2 use-after-free, SSL body loop).
 # Minimum is 1.30.7. A newer stable build is accepted. Existing /etc/nginx stays.
+# nginx.org still lists plucky, but that suite stopped at 1.28.2. noble has 1.30.7.
 KB_NGINX_MIN="1.30.7"
 kb_nginx_version() {
     nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
@@ -521,8 +522,23 @@ kb_nginx_ubuntu_codename() {
     esac
 }
 
+# True when that nginx.org stable suite publishes nginx >= KB_NGINX_MIN.
+kb_nginx_dist_has_min() {
+    local codename="$1" line base vers
+    vers="$(curl -fsSL "https://nginx.org/packages/ubuntu/dists/${codename}/nginx/binary-amd64/Packages.gz" 2>/dev/null | gzip -dc 2>/dev/null | awk '$1=="Package:" {pkg=$2} $1=="Version:" && pkg=="nginx" {print $2}' || true)"
+    [ -n "$vers" ] || return 1
+    while read -r line; do
+        [ -n "$line" ] || continue
+        base="${line%%-*}"
+        if dpkg --compare-versions "$base" ge "$KB_NGINX_MIN"; then
+            return 0
+        fi
+    done <<< "$vers"
+    return 1
+}
+
 kb_enable_nginx_official_repo() {
-    local codename keyring listfile pinfile
+    local codename keyring listfile pinfile preferred
     sudo apt-get install -y curl gnupg ca-certificates lsb-release
     keyring="/usr/share/keyrings/nginx-archive-keyring.gpg"
     listfile="/etc/apt/sources.list.d/nginx.list"
@@ -534,10 +550,15 @@ kb_enable_nginx_official_repo() {
         echo "ERROR: nginx.org signing key fingerprint mismatch." >&2
         return 1
     fi
-    codename="$(kb_nginx_ubuntu_codename)"
-    if ! curl -fsSL "https://nginx.org/packages/ubuntu/dists/${codename}/InRelease" >/dev/null 2>&1; then
-        echo "WARNING: nginx.org has no ${codename} packages; using noble."
+    preferred="$(kb_nginx_ubuntu_codename)"
+    if kb_nginx_dist_has_min "$preferred"; then
+        codename="$preferred"
+    elif [ "$preferred" != "noble" ] && kb_nginx_dist_has_min noble; then
+        echo "WARNING: nginx.org ${preferred} has no nginx >= ${KB_NGINX_MIN}. Using noble packages."
         codename="noble"
+    else
+        echo "ERROR: nginx.org has no nginx >= ${KB_NGINX_MIN} for ${preferred} or noble." >&2
+        return 1
     fi
     echo "deb [signed-by=${keyring}] https://nginx.org/packages/ubuntu ${codename} nginx" | sudo tee "$listfile" >/dev/null
     printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' | sudo tee "$pinfile" >/dev/null
