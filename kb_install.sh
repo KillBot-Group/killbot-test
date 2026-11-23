@@ -4811,7 +4811,7 @@ status() {
     check_internet
 
     local failed=0
-    local f apache_out nginx_out http_code server_ip php_ver php_ok skip_html_files=0
+    local f apache_out nginx_out http_code server_ip php_ver php_ok nginx_ver nginx_ok skip_html_files=0
 
     php_ver=\$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION.".".PHP_RELEASE_VERSION;' 2>/dev/null || true)
     php_ok=0
@@ -4825,6 +4825,18 @@ status() {
         echo "PHP \$php_ver is patched for PHP2Shell (CVE-2026-109618, CVE-2026-109619)."
     else
         echo "ERROR: PHP \${php_ver:-not installed} is vulnerable to PHP2Shell. Need 8.2.35+, 8.3.36+, 8.4.27+, or 8.5.12+. PHP 8.1 is not supported. Run: sudo /opt/killbot/UpdateAll.sh" >&2
+        failed=1
+    fi
+
+    nginx_ver=\$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    nginx_ok=0
+    if [ -n "\$nginx_ver" ] && dpkg --compare-versions "\$nginx_ver" ge 1.30.7; then
+        nginx_ok=1
+    fi
+    if [ "\$nginx_ok" -eq 1 ]; then
+        echo "nginx \$nginx_ver is patched (HTTP/2 memory corruption, HTTP/2 use-after-free, SSL body loop; CVE-2026-123007, CVE-2026-123633, CVE-2026-118899)."
+    else
+        echo "ERROR: nginx \${nginx_ver:-not installed} is not patched. Need 1.30.7 or newer. Run: sudo /opt/killbot/UpdateAll.sh" >&2
         failed=1
     fi
 
