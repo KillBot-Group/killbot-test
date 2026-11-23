@@ -88,11 +88,22 @@ else
     KB_GIT_REF="$(install_ref "$REF")"
 fi
 
-rm -f kbi.sh
-rm -f kb_install.sh
+# Stay next to this script. A shell started elsewhere would delete and run
+# a different kbi.sh than the one just downloaded.
+cd "$(cd "$(dirname "$0")" && pwd)"
+
+# wget keeps the existing kbi.sh and writes the new installer as kbi.sh.1
+# when it will not replace the file. Remove every previous copy first.
+rm -f kbi.sh kbi.sh.[0-9]* kb_install.sh kb_install.sh.[0-9]*
 echo "Downloading kb_install.sh from ${URL}"
 echo "Repository ${KB_GIT_REPO}, ref ${KB_GIT_REF}"
-wget -O kbi.sh "$URL"
+wget -O kbi.sh.new "$URL"
+if [[ ! -s kbi.sh.new ]]; then
+    echo "ERROR: downloaded installer is empty: ${URL}"
+    rm -f kbi.sh.new
+    exit 1
+fi
+mv -f kbi.sh.new kbi.sh
 chmod +x kbi.sh
 echo "Installing with KB_GIT_REPO=${KB_GIT_REPO} KB_GIT_REF=${KB_GIT_REF}"
 yes '' | sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a KB_GIT_REPO="${KB_GIT_REPO}" KB_GIT_REF="${KB_GIT_REF}" ./kbi.sh
